@@ -1,6 +1,7 @@
 /*
  * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
  * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
+ * picasso：另一台 K30 5G 上观察到 x0 不是设备树，而是 ABL 堆里的地址（见 loader.c 的 hunt_payload）。
  */
 	.section .text.head, "ax"
 	.globl _head

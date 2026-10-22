@@ -26,11 +26,13 @@ PANIC_LOG_SIZE = 0x100000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
-# picasso：真实的高位内存段还不知道（没有 root 读不到），先沿用 sweet 的保守值；
-# 8 GB 的 K30 5G 高位段应不小于它。拿到诊断 shim 显示的 DRAM banks 后，用
+# picasso：用另一台 8 GB K30 5G 上**真机验证过**的窗口 0x1_40000000 起 3 GiB（到 0x2_00000000）：
+# github.com/minhtritt1996/ios-picasso 用它启动 XNU、挂载 iOS 根分区、跑到 SpringBoard；
+# 原厂设备树里位置固定的保留区都在 0xA2400000 以下。那台手机上 ABL 不给设备树，
+# 所以真实的内存分布至今没人读到；若诊断 shim 显示了 DRAM banks，可用
 # --high-base=0x... --high-size=0x... 覆盖，不必改代码。
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+HIGH_PHYS_BASE = 0x140000000
+HIGH_MEM_SIZE = 0xC0000000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 

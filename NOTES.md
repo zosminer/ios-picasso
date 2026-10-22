@@ -26,10 +26,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 | 音量上 | PM6150L GPIO2，PPID 0x4c1，寄存器 0xc1xx | **PM8150L GPIO6，PPID 0x4c5，寄存器 0xc5xx** | 已改补丁 0060 |
 | 电量计 / 充电器 | PM6150（SID 0） | **PM7250B（SID 2）**：QGauge 0x4800，SMB5 0x1000-0x13ff | 补丁 0062（默认仍是固定 100%，sweetbattery=1 才读）。2026-10-22 用小米 picasso-r-oss 的 qg-reg.h / qg-util.c / qg-defs.h / smb5-reg.h **逐个核对**了 SweetBattery.cpp 用到的寄存器、位和换算系数（0x4804=0x0d、0x4808 位 0、0x48c0 ×194.637 µV、0x48c2 子类型 3/4 ×152.588/305.176 µA、0x1006/0x1007/0x100d、0x110b、0x1310 位 4），全部一致；SPMI 通道从仲裁器映射表动态查，不依赖 SoC |
 | 触屏 | Goodix GT9896，GENI I2C 0xa84000 | **Novatek NT36672C，GENI SPI，QUP SE7 0x984000**，复位 GPIO4，中断 GPIO5，5 MHz | sweet 的 I2C 驱动保持关闭；**新驱动 0082**（见下文“触屏驱动”），默认开启，开机 30 s 后启动 |
-| USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 是 EUD 使能寄存器，不碰） | **补丁 0083**：GCC 时钟偏移按 gcc-lito.c 改（sleep 0x0f018、utmi 0x0f01c、cfg-noc-axi 0x0f07c、aggre-axi 0x0f080；GDSC 0x0f004、master 0x0f010、clkref 0x8c010 不变；lito 没有 ahb2phy 分支，去掉），PHY 诊断改读 SNPS 寄存器，`sweetusb` 默认恢复为 1（只读状态）。DWC3 0x0a600000、QSCRATCH 0x0a6f8800 相同，原厂设备树同样 `maximum-speed = "high-speed"`，设备模式代码（DCFG 速率强制高速）不用改 |
+| USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 是 EUD 使能寄存器，不碰） | **补丁 0083**：GCC 时钟偏移按 gcc-lito.c 改（sleep 0x0f018、utmi 0x0f01c、cfg-noc-axi 0x0f07c、aggre-axi 0x0f080；GDSC 0x0f004、master 0x0f010、clkref 0x8c010 不变；ahb2phy 0x6a004 gcc-lito.c 没列但硬件里有，保留，它关着就不读 PHY），PHY 诊断改读 SNPS 寄存器，`sweetusb` 默认恢复为 1（只读状态）。DWC3 0x0a600000、QSCRATCH 0x0a6f8800 相同，原厂设备树同样 `maximum-speed = "high-speed"`，设备模式代码（DCFG 速率强制高速）不用改 |
 | 固定保留区最高处 | ramdump_fb 0xaf000000 | disp_rdump_region 0xac000000-0xad000000 | 0xb0000000-0xfd000000 内无固定保留区（已用脚本核对） |
 
 ### 本分支已完成的改动（全部离线完成，未上机）
+- 2026-10-22 晚：shim 在 x0 不是设备树时找负载（`hunt_payload`，带主机自测）、
+  屏幕打印 `ABL x0`；`mkadt.py --highmem` 默认 0x1_40000000 + 3 GiB；0083 加回 ahb2phy；本节上面两段真机结论。
 - `shim/`：上面的地址；新增 `fdt_memory_banks()`、`fdt_node_reg()`，启动时在屏幕上打印 ABL 填入的
   **DRAM 区段**和 **RMTFS 地址**（没有 root 读不到，必须上机拍照记录）；屏幕标题改为 "picasso K30 5G"。
 - `shim/build_macos.py`：在 Mac 上用 Homebrew LLVM 构建 shim 并打包 boot.img（原 build.sh 只能在 Linux 用）。
@@ -51,6 +53,45 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   另有 4 个构建脚本自带、针对其他 macOS 版本的补丁被跳过（原版 ios-sweet 跳过的也是这 4 个）。
   加上 0083 后本仓库 83 个补丁同样全部应用（2026-10-22）。
   打完补丁的源码里 picasso 常量已确认生效。本机检出位置：`../.scratch/xnu-8796-pristine`、`../.scratch/dxb`（不入库）。
+
+### 别人在 K30 5G 真机上的结论（github.com/minhtritt1996/ios-picasso，2026-10-20～22）
+这是**另一台** K30 5G（装 Droidian）上的观察，不是我们这台；本地参考副本在
+`../.scratch/github-refs/minhtritt-repo/`（NOTES.md 第 320-600、1060-1630 行最有用）。
+- **ABL 不在 x0 传设备树**：x0 = x1 = x2 = 0xA7EB0000 左右，是 ABL 堆里的地址。boot.img 头里的 ramdisk
+  地址、内核部分后面的内容都已被释放，读它们会触发 TrustZone 安全异常，CPU 当场停住、没有报错画面。
+  负载还在 x0 附近的堆里（0xA7EC0000）。**已处理**：`shim/loader.c` 的 `hunt_payload()` 在 x0 不是设备树时
+  从 x0 起上下交替逐页找 "SWEETXNU"，找到即停；`shim/loader_host_test.c` 自测通过；屏幕先打印 `ABL x0`。
+  后果：拿不到 ABL 填好的设备树，也就**读不到 DRAM 区段、RMTFS 和面板编号**（`picassopanel=` 不会出现，
+  触屏先用 fw01，不出点就用 `picassotouchfw=2/3`）。
+- **`fastboot boot` 被拒**："Failed to load/authenticate boot image: Load Error"（Droidian 自己的镜像也一样），
+  对方只能把 shim 刷进 boot 分区。我们的 ABL 是 MIUI 13 V13.0.3.0 带的，版本可能不同，先试 `fastboot boot`。
+- **内存**：0x1_40000000 起 3 GiB 可用，XNU 在那里跑到了 SpringBoard。**已改** `tools/mkadt.py --highmem` 默认值。
+- 根 `compatible` 必须是独立字符串列表且含 `xiaomi,sweet`（我们一直如此）；shim 不能往 ADT 写没读到的值（我们的 shim 不改 ADT）。
+- **命令行**：不要 `serial=3`（内核输出转到串口，屏幕上什么都看不到）；用 `debug=0x14e` 代替 `0xc`
+  （0xc 出错后自动重启，画面留不住）；`cpus=8` 在对方机器上能用。
+- **USB**：写 `QSCRATCH_GENERAL_CFG`（0x0a6f8808）会在 2-3 秒后被 RPM 看门狗整机重启（我们只读不写）；
+  ahb2phy 时钟 GCC 0x6a004 默认关（0x80000002），关着时 SNPS PHY 寄存器读出 0x88888888 这类假值；
+  设备模式 ep0 命令超时，对方还在调（Run 21 未出结果）。**已更正 0083**（加回 ahb2phy，关着就不读 PHY）。
+- **用户空间卡在苹果 logo** 的原因依次是：数据迁移每次开机都跑（要写 ByHost 偏好，UUID 由 ADT 的
+  unique-chip-id/chip-id 算出；我们的 ECID 和对方相同，按内核算法核对过 UUID 是
+  `47A4033D-9F31-5A46-90F4-BE29CA615E78`，同样的算法也能算出 sweet 记录的 A9683613-...）、CommCenter 崩溃循环、
+  SpringBoard 缺 `BoundingPathData.bundle`（报错 BoundingPathBitmap-1125x2436-375x812-3.00x）。
+  前两项 `tools/sweet-root-tweaks.py` 已有；第三项**制作镜像时要检查**。
+- 对方认为 `/product` 节点让 backboardd 要求 Metal 而黑屏；但 sweet 带 `/product` 能进主屏幕，对方那段时间还有别的改动，
+  结论不可靠。先保留；上机黑屏时再用不带 d22ap.adt 的 ADT 对比。
+- 对方的 0085（帧缓冲缓存刷新）我们不需要：SweetSurface 把面板内存映射成 write-combine。
+  0086/0087（来自 ios-topaz：IOAcceleratorES 空服务省掉 QuartzCore 30 秒等待、SweetSurface 完善）是通用改进，未移植，候选。
+- 对方说 Wi-Fi 搬不过来（以为是 cnss2）。原厂设备树是 `qcom,icnss@18800000` + WCN3990 蓝牙，
+  与 topaz/sapphire 的 WCN3988 看起来是同一类（固件在基带处理器上，主机走 CE/HTC/WMI/HTT），**待验证**。
+- picasso 有调试串口 `qcom,qup_uart@888000`（msm-geni-console），sweet 没有。
+- 对方触屏表里写“QCOM SPI v2，不是 GENI”、片选 gpio8，与原厂设备树不符：spi@984000 是 `qcom,spi-geni`，片选是 gpio9。
+
+### 同一颗触屏芯片的真机结果（github.com/arbuxiktech/ios-surya，Poco X3 NFC，SM7150，GENI SPI SE0）
+- 芯片 ID `0c 00 00 72 66 03` → NT36675 内存表、事件缓冲区 0x22D00、hw_crc 2，和 0082 的推测一致。
+- 固件下载顺序与 0082 相同（bootloader 复位 → 关快速读 → 写分区 → ILM/DLM CRC → BLD_CRC_EN|0x80 → 0x60=0、0x50=0xAE → BOOT_RDY）；
+  下载后 reset=0xA1、固件版本校验通过、读到触点并送进 SweetHID。
+- GENI SPI 设置（打包 0x7f8fe/0xffefe、字长 4、模式 0、CLK_SEL 0、不切片选）与 0082 一致；他们分频 2，0082 按不超过 5 MHz 计算。
+- 参考副本：`../.scratch/github-refs/ios-surya/`（补丁 0087、0090、0091）。
 
 ### 当前阻塞（按顺序）
 1. **内核要在 GitHub Actions（macos-14，Xcode 15）上编译**：需要用户的 GitHub 账号 fork 本仓库并运行 `xnu.yml`。
@@ -96,9 +137,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   上机第一次请录屏/拍照 `PICASSO TOUCH:` 开头的所有行。
 
 ### 下一步（具体动作）
-- 解锁后第一步：`python3 shim/build_macos.py`，`fastboot boot shim/out/shim-boot.img`（只进内存，不写分区）。
-  看屏幕：红底文字出现 = 帧缓冲地址正确；记下 "DRAM banks" 各段 base/size 和 "RMTFS base"，据此设置
-  `tools/mkadt.py --highmem --high-base= --high-size=`，并确认 RMTFS 不在 0xb0000000-0xfd000000 内。
+- 解锁后第一步：`python3 shim/build_macos.py`，先试 `fastboot boot shim/out/shim-boot.img`（只进内存，不写分区）。
+  - 如果报 "Failed to load/authenticate boot image"（另一台 K30 上就是这样）：**征得用户同意后**
+    `fastboot flash boot shim/out/shim-boot.img`。恢复 MIUI：`fastboot flash boot ../../firmware/V13.0.3.0.SGICNXM/boot.img`
+    （与手机系统同版本的原厂 boot）。K30 5G 没有 A/B 分区；fastboot 在 ABL 里，随时可按 电源+音量下 进入。
+  - 看屏幕：红底文字出现 = 帧缓冲地址正确；拍下 `ABL x0`、`x0 word0`（d00dfeed 表示 x0 就是设备树）和 `INITRD` 几行。
+    x0 是设备树时才会有 "DRAM banks"、"RMTFS"、"PANEL"；这时据此核对 `--highmem` 默认的 0x1_40000000 + 3 GiB。
+- 第一次带内核的命令行建议：`debug=0x14e cpus=1 keepsyms=1 -noprogress ... picassotouchlog=1`（**不要 serial=3**）。
 - 用户提供 GitHub 账号后：fork、推送 `picasso` 分支、`gh workflow run xnu.yml`，下载 `xnu-kernel` 产物，
   再 `tools/mkpayload.py`（命令行先用 `cpus=1`；触屏先加 `picassotouchlog=1`；想看真实电量加 `sweetbattery=1`；
   USB 默认只打印状态，要 USB 网络用 `sweetusb=2`）+ `shim/build_macos.py PAYLOAD`。

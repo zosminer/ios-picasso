@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
-@@ -4,7 +4,10 @@
+@@ -4,7 +4,11 @@
   * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
   * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
   * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
@@ -8,11 +8,12 @@
 + * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c).
 + * picasso（SM7250）：同一个 DWC3（0x0a600000，原厂设备树同样 maximum-speed = "high-speed"），
 + * USB2 PHY 换成 SNPS femto（hsphy@88e3000，phy-msm-snps-hs.c）；GDSC 仍是 0x0f004，
-+ * 时钟偏移按 gcc-lito.c 改（lito 没有单独的 ahb2phy 时钟分支）。ABL uses this
++ * 时钟偏移按 gcc-lito.c 改；ahb2phy（0x6a004）gcc-lito.c 没列但硬件里有。
++ * 设备模式（sweetusb=2）在 SM7250 上还需要完整的 SNPS PHY 初始化，尚未移植。ABL uses this
   * controller for fastboot; this probe only reports what state it is left
   * in after `fastboot boot`. It never writes a register, and it touches the
   * DWC3 / PHY register blocks only when the GCC status registers say their
-@@ -51,19 +54,20 @@ static const struct {
+@@ -51,19 +55,24 @@ static const struct {
  	const char *name;
  	uint32_t    off;
  } usb_cbcr[] = {
@@ -22,13 +23,16 @@
 -	{ "utmi", 0x0f018 },
 -	{ "cfg-noc-axi", 0x0502c },
 -	{ "aggre-axi", 0x8201c },
--	{ "ahb2phy", 0x6a004 },
 +	{ "sleep", 0x0f018 },
 +	{ "utmi", 0x0f01c },
 +	{ "cfg-noc-axi", 0x0f07c },
 +	{ "aggre-axi", 0x0f080 },
++	/* picasso：gcc-lito.c 没列这个分支，但硬件里有（另一台 K30 5G 真机读到 0x80000002 = 关）。
++	 * 它关着时 SNPS PHY 寄存器读出来是 0x88888888 这类总线填充值，写入被丢弃。下标 5。 */
+ 	{ "ahb2phy", 0x6a004 },
  	{ "clkref", 0x8c010 },
  };
++#define USB_CBCR_AHB2PHY        5
  
  #define DWC3_PA                 0x0a600000
  #define DWC3_SIZE               0x0000d000
@@ -40,7 +44,7 @@
  
  static uint32_t
  usb_rd(vm_offset_t base, uint32_t off)
-@@ -76,7 +80,7 @@ usb_rd(vm_offset_t base, uint32_t off)
+@@ -76,7 +85,7 @@ usb_rd(vm_offset_t base, uint32_t off)
  void
  sweet_usb_probe(void)
  {
@@ -49,16 +53,20 @@
  	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
  	bool clocks_on = true;
  
-@@ -119,19 +123,19 @@ sweet_usb_probe(void)
+@@ -119,19 +128,25 @@ sweet_usb_probe(void)
  	if (enabled >= 2) {
  		sweet_usb_gadget_start(dwc);
  	}
 -	if (cbcr[5] & CBCR_CLK_OFF) {
 -		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
--		return;
--	}
++	/* picasso：PHY 寄存器挂在 ahb2phy 桥后面，这个时钟关着就不读（读到的只是总线填充值）。
++	 * 注意：不要写 QSCRATCH_GENERAL_CFG（0x0a6f8808）：另一台 K30 5G 上写它会在 2-3 秒后
++	 * 被 RPM 看门狗整机重启（github.com/minhtritt1996/ios-picasso，Run 11/17）。本文件只读它。 */
++	if (cbcr[USB_CBCR_AHB2PHY] & CBCR_CLK_OFF) {
++		printf("SWEET USB: ahb2phy clock off; SNPS HSPHY not read\n");
+ 		return;
+ 	}
 -	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
-+	/* picasso：ABL 的 fastboot 刚用过这个 PHY，控制器有电有时钟时它的 AHB 也可读（只读诊断）。 */
 +	vm_offset_t phy = ml_io_map(HSPHY_PA, HSPHY_SIZE);
  	if (phy == 0) {
  		return;

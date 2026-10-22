@@ -379,6 +379,9 @@ void shim_main(uint64_t dtb)
 	stage = "loader";
 	con_clear(RED);
 	con_str("SHIM", "picasso K30 5G: xnu loader");
+	/* picasso：先把 ABL 给的 x0 打出来；它不是设备树时 loader 会在它附近找负载 */
+	con_hex("ABL x0", dtb);
+	con_hex("x0 word0", dtb ? __builtin_bswap32(rd32(dtb)) : 0);	/* d00dfeed = 设备树 */
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);

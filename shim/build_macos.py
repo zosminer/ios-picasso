@@ -119,6 +119,10 @@ def main():
     if stock_dtb.is_file():
         run('cc', '-O1', '-Wall', '-Wextra', '-Werror', '-o', OUT / 'fdt_host_test', HERE / 'fdt.c', HERE / 'fdt_host_test.c')
         run(OUT / 'fdt_host_test', stock_dtb, '0')
+    # 负载搜索自测（ABL 不给设备树时，在它的堆里找负载）
+    run('cc', '-O1', '-Wall', '-Wextra', '-Werror', '-o', OUT / 'loader_host_test',
+        HERE / 'console.c', HERE / 'fdt.c', HERE / 'loader_host_test.c')
+    run(OUT / 'loader_host_test')
     print(f'build_macos：Image {image.stat().st_size} 字节（_end = {end:#x}），'
           f'ramdisk {ramdisk.stat().st_size} 字节，boot.img {boot.stat().st_size} 字节 -> {boot}')
 

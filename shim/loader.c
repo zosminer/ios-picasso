@@ -76,13 +76,83 @@ static int magic_ok(const char *m)
 
 typedef void (*xnu_entry_t)(uint64_t boot_args_pa);
 
+/*
+ * picasso 新增：ABL 没给设备树时，在它的堆里找负载。
+ *
+ * 依据另一台 K30 5G 的真机结果（github.com/minhtritt1996/ios-picasso NOTES.md，2026-10-21）：
+ * - ABL 进入 shim 时 x0 = x1 = x2 = 0xA7EB0000 左右（每次开机略有变化），不是设备树，
+ *   而是 ABL 堆里的地址；静态设备树里也没有 linux,initrd-*。
+ * - boot.img 头里写的 ramdisk 地址（以及内核部分后面的内容）启动时已经被 ABL 释放，
+ *   读这些地址会触发 TrustZone 安全异常，CPU 当场停住，屏幕上没有任何报错。
+ * - ABL 读进来的整个 boot.img 还留在 x0 附近的堆里：负载在 0xA7EC0000，
+ *   离 x0 只有十几页。
+ * 所以从 x0 开始，向上、向下交替一页一页地看每页开头 8 字节是不是 "SWEETXNU"，
+ * 找到就立刻停：越过负载继续往外走会碰到没映射的页（对方真机上因此反复重启过）。
+ */
+#define HUNT_PAGE	0x1000UL
+#ifndef HUNT_WINDOW
+#define HUNT_WINDOW	0x4000000UL	/* 每个方向最多 64 MiB */
+#endif
+#ifndef DDR_LO
+#define DDR_LO		0x80000000UL	/* SM7250 的内存从这里开始，更低的地址是 XBL/AOP/TZ 等受保护区域 */
+#endif
+#ifndef DDR_HI
+#define DDR_HI		0x200000000UL	/* 8 GiB 机型的内存上限 */
+#endif
+
+static int page_is_payload(uintptr_t a)
+{
+	volatile const uint32_t *w = (volatile const uint32_t *)a;
+	return w[0] == 0x45455753U && w[1] == 0x554e5854U;	/* "SWEE" "TXNU"（小端） */
+}
+
+static uintptr_t hunt_payload(uintptr_t x0)
+{
+	if (x0 < DDR_LO || x0 >= DDR_HI)
+		return 0;
+	uintptr_t base = x0 & ~(HUNT_PAGE - 1);
+	con_hex("HUNT from", base);
+	for (uintptr_t off = 0; off < HUNT_WINDOW; off += HUNT_PAGE) {
+		uintptr_t up = base + off;
+		if (up < DDR_HI && page_is_payload(up))
+			return up;
+		if (off && base - off >= DDR_LO && page_is_payload(base - off))
+			return base - off;
+	}
+	return 0;
+}
+
+/* 负载的实际长度：段数据和 ADT 中最靠后的结尾 */
+static uint64_t payload_size(const struct payload *p)
+{
+	uint64_t end = p->adt_off + p->adt_size;
+	for (uint32_t i = 0; i < p->nsegs; i++) {
+		uint64_t e = p->segs[i].file_off + p->segs[i].file_size;
+		if (e > end)
+			end = e;
+	}
+	return end;
+}
+
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
 
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-		return "no initrd in /chosen";
+	if (fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) &&
+	    fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end)) {
+		con_str("INITRD", "from /chosen");
+	} else {
+		/* picasso：x0 不是设备树（或里面没有 initrd），去 ABL 的堆里找 */
+		con_str("INITRD", "not in a device tree, hunting near x0");
+		rd_start = hunt_payload(dtb);
+		if (!rd_start)
+			return "no SWEETXNU payload near x0";
+		con_hex("HUNT found", rd_start);
+		const struct payload *hp = (const struct payload *)rd_start;
+		if (hp->version != 1 || hp->nsegs > 64)
+			return "bad payload header";
+		rd_end = rd_start + payload_size(hp);
+	}
 	con_hex2("INITRD", "lo=", rd_start, "hi=", rd_end);
 
 	const struct payload *p = (const struct payload *)rd_start;
