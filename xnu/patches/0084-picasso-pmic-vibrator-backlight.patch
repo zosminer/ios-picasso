@@ -1,0 +1,853 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,8 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/picasso_touch.c			standard
++bsd/dev/picasso_vib.c			standard
++bsd/dev/picasso_backlight.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/picasso_backlight.c
+@@ -0,0 +1,253 @@
++/*
++ * picasso（红米 K30 5G）屏幕背光：LCD 面板（G7A，原厂设备树 qcom,mdss-dsi-bl-pmic-control-type =
++ * "bl_ctrl_wled"），由 PM8150L 第二从机地址（SID 5）上的 WLED5 驱动：
++ *   /soc/qcom,spmi@c440000/qcom,pm8150l@5/qcom,wled@d800，ctrl 0xd800、sink 0xd900，最大亮度 0xfff。
++ * 寄存器照小米开源内核 picasso-r-oss 的 drivers/video/backlight/qcom-spmi-wled.c（WLED5 部分）：
++ *   ctrl + 0x46 MOD_EN（位 7，打开后要等 10 ms 软启动）；
++ *   sink + 0x50 / 0x60 调制器 A / B 使能（位 7）；sink + 0x53/0x54、0x63/0x64 亮度（12 位）；
++ *   sink + 0x65 MOD_SYNC：写入亮度后置位 A（位 0）或 B（位 1）再清零，新亮度才生效。
++ * 只改亮度和总开关，不改 ABL 设好的电流、OVP、CABC 等配置；用 ABL 已经打开的那个调制器。
++ * 原厂驱动在亮度低于 1% 时还有一个采样保持的补丁，这里直接把最低亮度限制在 1%，避开那条路径。
++ *
++ * LCD 的背光是整块屏最耗电的部分：sweet 的“熄屏”只把画面变黑（OLED 黑色像素不发光），
++ * 在这块 LCD 上背光仍然亮着。这里在 iOS 请求熄屏时（IOMFB 选择子 12，SweetFramebuffer.cpp）关背光。
++ *
++ * 接口：picasso_backlight_power(on)、picasso_backlight_set(0..4095，0 = 关)；
++ *   sysctl kern.picasso_backlight（读：当前亮度；写：设亮度，需要 root）。
++ * boot-args：picassobl=0 不碰背光（默认 1）。
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern kern_return_t thread_terminate(thread_t);
++extern kern_return_t clear_wait(thread_t thread, wait_result_t result);
++void picasso_backlight_init(void);
++int picasso_backlight_set(int level);
++void picasso_backlight_power(int on);
++
++#define BL_SID          5u
++#define BL_CTRL         0xd800u
++#define BL_SINK         0xd900u
++#define BL_TYPE         0x04u
++#define BL_MOD_EN       0x46u           /* ctrl */
++#define BL_MOD_A_EN     0x50u           /* sink */
++#define BL_MOD_B_EN     0x60u
++#define BL_MOD_A_BRT    0x53u
++#define BL_MOD_B_BRT    0x63u
++#define BL_MOD_SYNC     0x65u
++#define BL_EN           0x80u
++#define BL_MAX          0xfff
++#define BL_MIN          ((BL_MAX + 99) / 100)   /* 1% */
++
++static struct {
++	bool started, ready, mod_b;
++	unsigned errors;
++	int applied;            /* 硬件上的亮度，0 = 背光关 */
++} bl;
++static volatile SInt32 bl_level = BL_MAX;      /* 最近一次设置的亮度（不含熄屏） */
++static volatile SInt32 bl_power = 1;           /* 显示开 */
++static volatile SInt32 bl_seq;
++static int bl_chan;
++
++static int
++bl_rd(unsigned addr, uint8_t *v)
++{
++	return sweet_spmi_read(BL_SID, addr, v);
++}
++
++static int
++bl_wr(unsigned addr, const uint8_t *v, unsigned len)
++{
++	return sweet_spmi_write(BL_SID, addr, v, len);
++}
++
++static int
++bl_module(bool on)
++{
++	uint8_t v = 0;
++	if (bl_rd(BL_CTRL + BL_MOD_EN, &v)) {
++		return -1;
++	}
++	v = on ? (uint8_t)(v | BL_EN) : (uint8_t)(v & ~BL_EN);
++	return bl_wr(BL_CTRL + BL_MOD_EN, &v, 1);
++}
++
++/* 写亮度并同步到调制器（wled5_set_brightness） */
++static int
++bl_brightness(int level)
++{
++	const uint8_t v[2] = {(uint8_t)(level & 0xff), (uint8_t)((level >> 8) & 0x0f)};
++	uint8_t sync = 0;
++	unsigned reg = BL_SINK + (bl.mod_b ? BL_MOD_B_BRT : BL_MOD_A_BRT);
++	if (bl_wr(reg, v, 2) || bl_rd(BL_SINK + BL_MOD_SYNC, &sync)) {
++		return -1;
++	}
++	uint8_t set = (uint8_t)((sync & ~0x03u) | (bl.mod_b ? 0x02u : 0x01u));
++	uint8_t clr = (uint8_t)(sync & ~0x0fu);
++	return (bl_wr(BL_SINK + BL_MOD_SYNC, &set, 1) || bl_wr(BL_SINK + BL_MOD_SYNC, &clr, 1)) ? -1 : 0;
++}
++
++static void
++bl_apply(int want)
++{
++	int err = 0;
++	if (want == bl.applied) {
++		return;
++	}
++	if (want == 0) {
++		err = bl_module(false);
++	} else {
++		err = bl_brightness(want);
++		if (!err && bl.applied == 0) {
++			err = bl_module(true);
++			delay(10000);   /* WLED_SOFT_START_DLY_US */
++		}
++	}
++	if (err) {
++		++bl.errors;
++		printf("PICASSO BL: PMIC write failed (want %d)\n", want);
++		return;
++	}
++	bl.applied = want;
++}
++
++static void
++bl_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	SInt32 seen = -1;
++	for (;;) {
++		SInt32 seq = bl_seq;
++		if (seq != seen) {
++			seen = seq;
++			int level = bl_level;
++			bl_apply(bl_power ? level : 0);
++		}
++		if (bl.errors > 20) {
++			printf("PICASSO BL: too many PMIC errors; driver stopped (backlight left as is)\n");
++			bl.ready = false;
++			break;
++		}
++		(void)assert_wait(&bl_chan, THREAD_UNINT);
++		if (bl_seq != seen) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			continue;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++bl_kick(void)
++{
++	__asm__ volatile("dmb ish" ::: "memory");
++	OSIncrementAtomic(&bl_seq);
++	thread_wakeup(&bl_chan);
++}
++
++int
++picasso_backlight_set(int level)
++{
++	if (!bl.ready) {
++		return ENXIO;
++	}
++	if (level < 0) {
++		level = 0;
++	}
++	if (level > BL_MAX) {
++		level = BL_MAX;
++	}
++	if (level > 0 && level < BL_MIN) {
++		level = BL_MIN;
++	}
++	bl_level = level;
++	bl_kick();
++	return 0;
++}
++
++void
++picasso_backlight_power(int on)
++{
++	if (!bl.ready) {
++		return;
++	}
++	bl_power = on ? 1 : 0;
++	bl_kick();
++}
++
++static int
++sysctl_picasso_backlight(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	int level = bl_level, changed = 0;
++	int error = sysctl_io_number(req, level, sizeof(level), &level, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return picasso_backlight_set(level);
++}
++SYSCTL_PROC(_kern, OID_AUTO, picasso_backlight, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_picasso_backlight, "I", "picasso: LCD backlight 0..4095 (0 = off)");
++
++void
++picasso_backlight_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (bl.started) {
++		return;
++	}
++	bl.started = true;
++	(void)PE_parse_boot_argn("picassobl", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("PICASSO BL: disabled (picassobl=0)\n");
++		return;
++	}
++	if (sweet_spmi_init()) {
++		printf("PICASSO BL: SPMI not available\n");
++		return;
++	}
++	uint8_t type = 0, mod = 0, a = 0, b = 0, alo = 0, ahi = 0, blo = 0, bhi = 0;
++	int e = bl_rd(BL_CTRL + BL_TYPE, &type) | bl_rd(BL_CTRL + BL_MOD_EN, &mod) |
++	    bl_rd(BL_SINK + BL_MOD_A_EN, &a) | bl_rd(BL_SINK + BL_MOD_B_EN, &b) |
++	    bl_rd(BL_SINK + BL_MOD_A_BRT, &alo) | bl_rd(BL_SINK + BL_MOD_A_BRT + 1u, &ahi) |
++	    bl_rd(BL_SINK + BL_MOD_B_BRT, &blo) | bl_rd(BL_SINK + BL_MOD_B_BRT + 1u, &bhi);
++	int abrt = ((ahi & 0x0f) << 8) | alo, bbrt = ((bhi & 0x0f) << 8) | blo;
++	printf("PICASSO BL: WLED5 type=%#x module=%#x modA=%#x/%d modB=%#x/%d err=%d\n",
++	    type, mod, a, abrt, b, bbrt, e);
++	if (e || type == 0x00 || type == 0xff) {
++		printf("PICASSO BL: WLED not answering; driver off\n");
++		return;
++	}
++	if (!(a & BL_EN) && !(b & BL_EN)) {
++		printf("PICASSO BL: no modulator enabled by the bootloader; driver off\n");
++		return;
++	}
++	bl.mod_b = !(a & BL_EN);
++	int cur = bl.mod_b ? bbrt : abrt;
++	bl_level = cur > 0 ? cur : BL_MAX;
++	bl.applied = (mod & BL_EN) ? (cur > 0 ? cur : BL_MAX) : 0;
++	bl.ready = true;
++	kern_return_t kr = kernel_thread_start(bl_thread, NULL, &thread);
++	if (kr != KERN_SUCCESS) {
++		bl.ready = false;
++		printf("PICASSO BL: kernel_thread_start failed %d\n", kr);
++		return;
++	}
++	thread_deallocate(thread);
++	printf("PICASSO BL: ready, modulator %c, brightness %d/%d (sysctl kern.picasso_backlight)\n",
++	    bl.mod_b ? 'B' : 'A', (int)bl_level, BL_MAX);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/picasso_vib.c
+@@ -0,0 +1,281 @@
++/*
++ * picasso（红米 K30 5G）振动马达：PM7250B 第二从机地址（SID 3）上的 LDO 振动器，
++ * 原厂设备树 /soc/qcom,spmi@c440000/qcom,pm7250b@3/qcom,vibrator@5300：
++ *   compatible "qcom,qpnp-vibrator-ldo"，qcom,vib-ldo-volt-uv = 3000000，qcom,disable-overdrive。
++ * 寄存器照小米开源内核 picasso-r-oss 的 drivers/leds/leds-qpnp-vibrator-ldo.c：
++ *   STATUS1 0x08（位 7 VREG_READY）、VSET_LB/UB 0x40/0x41（毫伏，8 mV 步进，1504..3544）、
++ *   EN_CTL 0x46（位 7 打开）。打开后等 VREG_READY（最多 1 ms），没就绪就关掉。
++ * 这颗马达是普通的偏心转子马达，只有开/关和电压，没有苹果 Taptic Engine 那样的波形。
++ *
++ * 用法：
++ *   内核里：picasso_vibrate(ms)，ms <= 0 立即停；50..15000 之外会被夹到范围内（与原厂相同）。
++ *   用户空间：sysctl kern.picasso_vibrate=200（需要 root），以后接 iOS 的振动请求时用。
++ * boot-args：
++ *   picassovib=0           关闭（默认 1）
++ *   picassovibtest=N       开机后振动 N 毫秒一次，用来确认硬件（默认 0 = 不振）
++ *   picassovibdelay=N      自检在开机 N 秒后进行（默认 20）
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/OSAtomic.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern kern_return_t thread_terminate(thread_t);
++/* kern/sched_prim.h 里只在 XNU_KERNEL_PRIVATE 下声明 */
++extern kern_return_t clear_wait(thread_t thread, wait_result_t result);
++void picasso_vib_init(void);
++int picasso_vibrate(int ms);
++
++#define PV_SID          3u
++#define PV_BASE         0x5300u
++#define PV_TYPE         0x04u
++#define PV_SUBTYPE      0x05u
++#define PV_STATUS1      0x08u
++#define PV_VREG_READY   0x80u
++#define PV_VSET_LB      0x40u
++#define PV_EN_CTL       0x46u
++#define PV_EN           0x80u
++#define PV_VMIN_MV      1504u
++#define PV_VMAX_MV      3544u
++#define PV_VOLT_MV      3000u   /* qcom,vib-ldo-volt-uv；disable-overdrive，所以不先过压 */
++#define PV_MIN_MS       50
++#define PV_MAX_MS       15000
++_Static_assert(PV_VOLT_MV >= PV_VMIN_MV && PV_VOLT_MV <= PV_VMAX_MV && PV_VOLT_MV % 8 == 0,
++    "vibrator LDO voltage outside the 1504..3544 mV / 8 mV range");
++
++static struct {
++	bool started, ready, on;
++	unsigned errors;
++} pv;
++static volatile SInt32 pv_seq;
++static volatile SInt32 pv_ms;
++static int pv_chan, pv_test_chan;
++
++static int
++pv_read(unsigned reg, uint8_t *v)
++{
++	return sweet_spmi_read(PV_SID, PV_BASE + reg, v);
++}
++
++static int
++pv_write(unsigned reg, const uint8_t *v, unsigned len)
++{
++	return sweet_spmi_write(PV_SID, PV_BASE + reg, v, len);
++}
++
++static void
++pv_off(void)
++{
++	uint8_t en = 0;
++	bool known = pv_read(PV_EN_CTL, &en) == 0;
++	if (!known) {
++		/* 读不到当前值：直接写 0，确保马达停下 */
++		++pv.errors;
++		en = 0;
++	} else if (!(en & PV_EN)) {
++		pv.on = false;
++		return;
++	} else {
++		en = (uint8_t)(en & ~PV_EN);
++	}
++	if (pv_write(PV_EN_CTL, &en, 1)) {
++		++pv.errors;
++	}
++	pv.on = false;
++}
++
++static bool
++pv_on(void)
++{
++	uint8_t en = 0, st = 0;
++	if (pv_read(PV_EN_CTL, &en)) {
++		++pv.errors;
++		return false;
++	}
++	en |= PV_EN;
++	if (pv_write(PV_EN_CTL, &en, 1)) {
++		++pv.errors;
++		pv_off();
++		return false;
++	}
++	pv.on = true;
++	/* 原厂：每 100 us 查一次 VREG_READY，最多 1 ms；没就绪就关掉 */
++	for (unsigned i = 0; i < 10; ++i) {
++		if (!pv_read(PV_STATUS1, &st) && (st & PV_VREG_READY)) {
++			return true;
++		}
++		delay(100);
++	}
++	printf("PICASSO VIB: VREG_READY timeout (status=%#x); off\n", st);
++	++pv.errors;
++	pv_off();
++	return false;
++}
++
++/* 所有 PMIC 操作都在这一个线程里做，调用者只记下请求再唤醒它 */
++static void
++pv_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	SInt32 seen = 0;	/* 线程启动前已到的请求也要处理 */
++	uint64_t off_at = 0;
++	for (;;) {
++		SInt32 seq = pv_seq;
++		if (seq != seen) {
++			seen = seq;
++			int ms = pv_ms;
++			if (ms <= 0) {
++				if (pv.on) {
++					pv_off();
++				}
++				off_at = 0;
++			} else {
++				if (ms < PV_MIN_MS) {
++					ms = PV_MIN_MS;
++				}
++				if (ms > PV_MAX_MS) {
++					ms = PV_MAX_MS;
++				}
++				if (pv.on || pv_on()) {
++					clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &off_at);
++				} else {
++					off_at = 0;
++				}
++			}
++		}
++		if (pv.on && off_at && mach_absolute_time() >= off_at) {
++			pv_off();
++			off_at = 0;
++		}
++		if (pv.errors > 20) {
++			printf("PICASSO VIB: too many PMIC errors; driver stopped\n");
++			pv_off();
++			pv.ready = false;
++			break;
++		}
++		if (pv.on && off_at) {
++			(void)assert_wait_deadline(&pv_chan, THREAD_UNINT, off_at);
++		} else {
++			(void)assert_wait(&pv_chan, THREAD_UNINT);
++		}
++		/* 请求可能在上面检查之后、assert_wait 之前到达：再看一次，避免漏掉唤醒 */
++		if (pv_seq != seen) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			continue;
++		}
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++int
++picasso_vibrate(int ms)
++{
++	if (!pv.ready) {
++		return ENXIO;
++	}
++	pv_ms = ms;
++	__asm__ volatile("dmb ish" ::: "memory");
++	OSIncrementAtomic(&pv_seq);
++	thread_wakeup(&pv_chan);
++	return 0;
++}
++
++static int
++sysctl_picasso_vibrate(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++	int ms = 0, changed = 0;
++	int error = sysctl_io_number(req, 0, sizeof(ms), &ms, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	return picasso_vibrate(ms);
++}
++SYSCTL_PROC(_kern, OID_AUTO, picasso_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_picasso_vibrate, "I", "picasso: vibrate for N ms (0 = stop)");
++
++/* 开机自检线程：等 picassovibdelay 秒后振 picassovibtest 毫秒 */
++static void
++pv_selftest(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 20, test_ms = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("picassovibdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("picassovibtest", &test_ms, sizeof(test_ms));
++	uint64_t deadline;
++	clock_interval_to_deadline(delay_s * 1000u, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pv_test_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	printf("PICASSO VIB: self-test %u ms\n", test_ms);
++	(void)picasso_vibrate((int)test_ms);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++picasso_vib_init(void)
++{
++	int enabled = 1;
++	unsigned test_ms = 0;
++	thread_t thread;
++	if (pv.started) {
++		return;
++	}
++	pv.started = true;
++	(void)PE_parse_boot_argn("picassovib", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("picassovibtest", &test_ms, sizeof(test_ms));
++	if (!enabled) {
++		printf("PICASSO VIB: disabled (picassovib=0)\n");
++		return;
++	}
++	if (sweet_spmi_init()) {
++		printf("PICASSO VIB: SPMI not available\n");
++		return;
++	}
++	uint8_t type = 0, sub = 0, st = 0, en = 0, lb = 0, ub = 0;
++	int e = pv_read(PV_TYPE, &type) | pv_read(PV_SUBTYPE, &sub) | pv_read(PV_STATUS1, &st) |
++	    pv_read(PV_EN_CTL, &en) | pv_read(PV_VSET_LB, &lb) | pv_read(PV_VSET_LB + 1u, &ub);
++	unsigned mv = ((unsigned)ub << 8) | lb;
++	printf("PICASSO VIB: PM7250B SID3 0x5300 type=%#x subtype=%#x status=%#x en=%#x vset=%u mV err=%d\n",
++	    type, sub, st, en, mv, e);
++	/* 读不到，或者是空外设（0x00/0xff），就不碰它 */
++	if (e || type == 0x00 || type == 0xff) {
++		printf("PICASSO VIB: peripheral not answering; driver off\n");
++		return;
++	}
++	/* 原厂驱动启动时就把电压设成 vmax；马达这时是关着的 */
++	if (en & PV_EN) {
++		pv_off();
++	}
++	if (mv != PV_VOLT_MV) {
++		const uint8_t v[2] = {PV_VOLT_MV & 0xffu, PV_VOLT_MV >> 8};
++		if (pv_write(PV_VSET_LB, v, 2)) {
++			printf("PICASSO VIB: cannot set %u mV; driver off\n", PV_VOLT_MV);
++			return;
++		}
++	}
++	pv.ready = true;
++	kern_return_t kr = kernel_thread_start(pv_thread, NULL, &thread);
++	if (kr != KERN_SUCCESS) {
++		pv.ready = false;
++		printf("PICASSO VIB: kernel_thread_start failed %d\n", kr);
++		return;
++	}
++	thread_deallocate(thread);
++	printf("PICASSO VIB: ready at %u mV (sysctl kern.picasso_vibrate)\n", PV_VOLT_MV);
++	if (test_ms && kernel_thread_start(pv_selftest, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -1,7 +1,8 @@
+ /*
+  * Battery-only adaptation of input/sweet_keys.c, observer EXT_READL.
+- * PMIC READ ONLY. The only MMIO store issues a one-byte read command.
++ * PMIC READ ONLY for the battery. The only MMIO store issues a one-byte read command.
+  * No interrupt clear, peripheral enable, charger config, or PMIC writes.
++ * picasso：唯一的例外是 sweet_spmi_write()，只能写振动马达和背光的几个寄存器（见文件末尾）。
+  * Init is serialized by the single built-in SweetBattery personality.
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  */
+@@ -10,6 +11,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <libkern/OSAtomic.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -17,12 +19,16 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ #define SP_CORE_PA 0x0c440000u
+ #define SP_OBS_PA  0x0e600000u
+ #define SP_CFG_PA  0x0c40a000u
++/* picasso：读写通道（设备树 reg-names "chnls"），每个 APID 0x10000 一个窗口，只映射用到的那一页 */
++#define SP_CHNLS_PA 0x0c600000u
+ #define SP_NO_APID 0xffffu
+ 
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static bool sp_ready;
++/* picasso：电池（IOKit）和振动马达（BSD 线程）两个调用者，初始化用原子状态串行化：0 未开始、1 进行中、2 完成 */
++static volatile UInt32 sp_init_state;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
+@@ -51,13 +57,27 @@ sp_find_apid(unsigned ppid)
+ 	return found;
+ }
+ 
++static int sweet_spmi_init_once(void);
++
+ int
+ sweet_spmi_init(void)
+ {
+-	if (sp_attempted) {
+-		return sp_ready ? 0 : -1;
++	if (OSCompareAndSwap(0, 1, &sp_init_state)) {
++		(void)sweet_spmi_init_once();
++		__asm__ volatile("dmb ish" ::: "memory");
++		sp_init_state = 2;
++	}
++	/* 另一个调用者正在初始化：最多等 1 秒 */
++	for (unsigned i = 0; i < 1000 && sp_init_state != 2; ++i) {
++		delay(1000);
+ 	}
+-	sp_attempted = true;
++	__asm__ volatile("dmb ish" ::: "memory");
++	return (sp_init_state == 2 && sp_ready) ? 0 : -1;
++}
++
++static int
++sweet_spmi_init_once(void)
++{
+ 	sp_lock = IOLockAlloc();
+ 	if (!sp_lock) {
+ 		return -1;
+@@ -83,14 +103,33 @@ sweet_spmi_init(void)
+ 	return 0;
+ }
+ 
++/* picasso：PM7250B 第二个从机地址（SID 3）上的振动马达 LDO（设备树 qcom,vibrator@5300） */
++#define SP_VIB_SID      3u
++#define SP_VIB_PERIPH   0x53u
++/* picasso：PM8150L 第二个从机地址（SID 5）上的 WLED5 背光（设备树 qcom,wled@d800，ctrl 0xd800 / sink 0xd900） */
++#define SP_WLED_SID     5u
++#define SP_WLED_CTRL    0xd8u
++#define SP_WLED_SINK    0xd9u
++
++static bool
++sp_read_allowed(unsigned sid, unsigned peripheral)
++{
++	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	if (sid == 2) {
++		return peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
++		       peripheral == 0x13 || peripheral == 0x48;
++	}
++	if (sid == SP_WLED_SID) {
++		return peripheral == SP_WLED_CTRL || peripheral == SP_WLED_SINK;
++	}
++	return sid == SP_VIB_SID && peripheral == SP_VIB_PERIPH;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 2 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	if (!sp_ready || !out || addr > 0xffffu || !sp_read_allowed(sid, peripheral)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -123,4 +162,107 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * picasso 新增：PMIC 写入，**只允许**下面几个寄存器：
++ *   振动马达 LDO（SID 3）：VSET_LB 0x5340、VSET_UB 0x5341（电压，毫伏）、EN_CTL 0x5346（位 7 = 打开）；
++ *   WLED5 背光（SID 5）：MOD_EN 0xd846（位 7）、MOD_A/B 亮度 0xd953/0xd954、0xd963/0xd964、
++ *   MOD_SYNC 0xd965。
++ * 照 Linux spmi-pmic-arb.c 的 v5 写法：用该 APID 自己的读写通道
++ * （chnls + 0x10000 * APID），WDATA0 放数据，CMD = EXT_WRITEL(0)<<27 | 偏移<<4 | 字节数-1，
++ * 等 STATUS 的 DONE；而且和 Linux 一样，只有所有权表说这个 APID 归应用处理器（EE 0）时才写。
++ */
++static struct {
++	uint16_t apid;
++	vm_offset_t va;
++} sp_chnl[4] = {{SP_NO_APID, 0}, {SP_NO_APID, 0}, {SP_NO_APID, 0}, {SP_NO_APID, 0}};
++
++static bool
++sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
++{
++	unsigned per = addr >> 8, off = addr & 0xffu;
++	if (len < 1 || len > 2) {
++		return false;
++	}
++	if (sid == SP_VIB_SID && per == SP_VIB_PERIPH) {
++		return off == 0x40 || ((off == 0x41 || off == 0x46) && len == 1);
++	}
++	if (sid == SP_WLED_SID && per == SP_WLED_CTRL) {
++		return off == 0x46 && len == 1;
++	}
++	if (sid == SP_WLED_SID && per == SP_WLED_SINK) {
++		return off == 0x53 || off == 0x63 || ((off == 0x54 || off == 0x64 || off == 0x65) && len == 1);
++	}
++	return false;
++}
++
++/* 调用时已持有 sp_lock */
++static vm_offset_t
++sp_chnl_map(uint16_t apid)
++{
++	for (unsigned i = 0; i < sizeof(sp_chnl) / sizeof(sp_chnl[0]); ++i) {
++		if (sp_chnl[i].apid == apid) {
++			return sp_chnl[i].va;
++		}
++		if (sp_chnl[i].apid == SP_NO_APID) {
++			vm_offset_t va = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x1000);
++			if (va) {
++				sp_chnl[i].apid = apid;
++				sp_chnl[i].va = va;
++			}
++			return va;
++		}
++	}
++	return 0;
++}
++
++int
++sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len)
++{
++	unsigned off = addr & 0xffu;
++	if (!sp_ready || !data || addr > 0xffffu || !sp_write_allowed(sid, addr, len)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	if (owner != 0) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET SPMI: APID %u (sid %u per %#x) owned by EE %u; write refused\n",
++		    apid, sid, addr >> 8, owner);
++		return -1;
++	}
++	vm_offset_t chnl = sp_chnl_map(apid);
++	if (!chnl) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	uint32_t word = data[0] | (len > 1 ? (uint32_t)data[1] << 8 : 0u);
++	uint32_t cmd = (0u << 27) | (off << 4) | (len - 1u);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(chnl + 0x10u) = word;	/* WDATA0 */
++	*(volatile uint32_t *)(chnl + 0x00u) = cmd;	/* CMD */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(chnl, 0x08u);
++		if (status & 1u) {
++			IOLockUnlock(sp_lock);
++			if (status & 0x0eu) {
++				printf("SWEET SPMI: write sid=%u addr=%#x status=%#x (failure/denied/dropped)\n",
++				    sid, addr, status);
++				return -1;
++			}
++			return 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
++	IOLockUnlock(sp_lock);
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,9 @@ extern "C" {
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* picasso：只能写振动马达 LDO（SID 3 的 0x5340/0x5341/0x5346）和 WLED5 背光
++ * （SID 5 的 0xd846、0xd953/54、0xd963/64、0xd965）；线程上下文；0 成功，-1 失败。 */
++int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,8 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void picasso_touch_init(void);
++extern void picasso_vib_init(void);
++extern void picasso_backlight_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -662,6 +664,10 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	/* picasso：Novatek NT36672C SPI 触控（bsd/dev/picasso_touch.c） */
+ 	picasso_touch_init();
++	/* picasso：PM7250B LDO 振动马达（bsd/dev/picasso_vib.c） */
++	picasso_vib_init();
++	/* picasso：PM8150L WLED5 LCD 背光（bsd/dev/picasso_backlight.c） */
++	picasso_backlight_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void picasso_backlight_power(int on);        /* bsd/dev/picasso_backlight.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -62,6 +63,10 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	/* picasso：可能与亮度有关的 IOMFB 选择子（IOMobileFramebuffer.framework 的 kern_* 表） */
++	kSweetFBSetBrightnessCorrection = 50,
++	kSweetFBSPLCSetBrightness       = 66,
++	kSweetFBSetParameter            = 68,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -542,9 +547,31 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
++			/* picasso：LCD 的背光不会因为画面变黑而熄灭，真正关掉它（bsd/dev/picasso_backlight.c） */
++			picasso_backlight_power(off ? 0 : 1);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;
++	case kSweetFBSetBrightnessCorrection:
++	case kSweetFBSPLCSetBrightness:
++	case kSweetFBSetParameter: {
++		/* picasso：还不知道 iOS 16 用哪个接口调亮度，先把前几次调用的参数记下来，上机后再接 */
++		static uint32_t seen[3];
++		uint32_t k = selector == kSweetFBSetBrightnessCorrection ? 0 :
++		    (selector == kSweetFBSPLCSetBrightness ? 1 : 2);
++		if (seen[k]++ < 8) {
++			char who[32];
++			proc_selfname(who, sizeof(who));
++			IOLog("SWEET FB: %s brightness? sel %u scalars %u [%#llx %#llx %#llx %#llx] struct %u\n",
++			    who, selector, args->scalarInputCount,
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
++			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
++			    args->scalarInputCount > 3 ? args->scalarInput[3] : 0,
++			    args->structureInputSize);
++		}
++		break;
++	}
+ 	case kSweetFBSwapWait:
+ 	default:
+ 		break;

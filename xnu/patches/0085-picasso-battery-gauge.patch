@@ -1,0 +1,540 @@
+--- /dev/null
++++ b/bsd/dev/picasso_gauge.h
+@@ -0,0 +1,203 @@
++/*
++ * picasso（红米 K30 5G）电量计算法：纯函数，不碰硬件，电脑上可以直接测试
++ * （tools/picasso-gauge-test.c）。使用前须已有 uint8_t/int16_t/uint16_t/int64_t 等类型。
++ *
++ * PM7250B 的 QGauge 只测电压和电流，百分比是 Linux 驱动（qpnp-qg.c）用电池曲线算出来的。
++ * 这里做一个简化版，照它的思路：
++ *   1. 开机：MIUI 关机时 QG 把电量存在 SDAM（0xb146 有效标志、0xb147 电量 %），和由当前电压
++ *      查表得到的电量相差不超过 PG_SDAM_TRUST 就用它；否则用“开路电压 → 电量”查表
++ *      （开路电压 ≈ 端电压 - 电流 × 电池内阻；内阻用 SDAM 里 QG 学到的值，不合理就用 150 mΩ）。
++ *   2. 运行：按电流积分（库仑计），容量用 SDAM 里 QG 学到的容量，不合理就用曲线里 25 °C 的满电容量。
++ *   3. 静置（|电流| < 30 mA 连续 5 分钟）：每次更新把电量向开路电压查表结果拉近 1/8，修正积分误差。
++ *   4. 充电器报“充满”就是 100%；充电中、没充满最多显示 99%；电压低于关机电压 3400 mV
++ *      （qcom,vbatt-cutoff-mv）时最多 1%。
++ * 电流方向用 IOPMPowerSource 的约定：正数 = 充电。温度没有测（用 25 °C）。
++ */
++#ifndef PICASSO_GAUGE_H
++#define PICASSO_GAUGE_H
++
++#include "picasso_gauge_lut.h"
++
++#define PG_DEFAULT_RBAT_MOHM  150
++#define PG_REST_MA            30
++#define PG_REST_MS            (5u * 60u * 1000u)
++#define PG_SDAM_TRUST         15      /* % */
++#define PG_CUTOFF_MV          3400
++#define PG_TEMP_DC            250     /* 0.1 °C */
++
++static inline int
++pg_lerp(int x, int x0, int y0, int x1, int y1)
++{
++	if (x1 == x0) {
++		return y0;
++	}
++	return y0 + (int)((int64_t)(x - x0) * (y1 - y0) / (x1 - x0));
++}
++
++/* 一列：OCV（0.1 mV）→ 电量（0.01%）。表按电量从高到低，OCV 也从高到低。 */
++static inline int
++pg_col_soc(const uint16_t *tab, int cols, int col, int ocv_dmv)
++{
++	if (ocv_dmv >= tab[col]) {
++		return pg_rows[0];
++	}
++	if (ocv_dmv <= tab[(PG_ROWS - 1) * cols + col]) {
++		return pg_rows[PG_ROWS - 1];
++	}
++	for (int i = 1; i < PG_ROWS; ++i) {
++		int hi = tab[(i - 1) * cols + col], lo = tab[i * cols + col];
++		if (ocv_dmv >= lo) {
++			return pg_lerp(ocv_dmv, lo, pg_rows[i], hi, pg_rows[i - 1]);
++		}
++	}
++	return pg_rows[PG_ROWS - 1];
++}
++
++/* 开路电压（µV）→ 电量（0.01%），温度 0.1 °C；与 qg_interpolate_soc 一样在两列温度之间插值 */
++static inline int
++pg_ocv_to_soc(int ocv_uv, int temp_dc, int charging)
++{
++	const uint16_t *tab = charging ? pg_v1 : pg_v2;
++	const int16_t *cols = charging ? pg_v1_cols : pg_v2_cols;
++	int n = charging ? PG_V1_COLS : PG_V2_COLS;
++	int ocv = ocv_uv / 100;
++	if (temp_dc <= cols[0] * 10) {
++		return pg_col_soc(tab, n, 0, ocv);
++	}
++	if (temp_dc >= cols[n - 1] * 10) {
++		return pg_col_soc(tab, n, n - 1, ocv);
++	}
++	int j = 1;
++	while (j < n - 1 && temp_dc > cols[j] * 10) {
++		++j;
++	}
++	int lo = pg_col_soc(tab, n, j - 1, ocv), hi = pg_col_soc(tab, n, j, ocv);
++	return pg_lerp(temp_dc, cols[j - 1] * 10, lo, cols[j] * 10, hi);
++}
++
++/* 满电容量（mAh）随温度 */
++static inline int
++pg_fcc(int temp_dc, int charging)
++{
++	const int16_t *cols = charging ? pg_fcc1_cols : pg_fcc2_cols;
++	const int16_t *v = charging ? pg_fcc1 : pg_fcc2;
++	int n = charging ? PG_FCC1_COLS : PG_FCC2_COLS;
++	if (temp_dc <= cols[0] * 10) {
++		return v[0];
++	}
++	for (int j = 1; j < n; ++j) {
++		if (temp_dc <= cols[j] * 10) {
++			return pg_lerp(temp_dc, cols[j - 1] * 10, v[j - 1], cols[j] * 10, v[j]);
++		}
++	}
++	return v[n - 1];
++}
++
++struct pg_state {
++	int64_t charge_uah;     /* 剩余电量 */
++	int fcc_mah;            /* 积分用的容量 */
++	int rbat_mohm;
++	unsigned rest_ms;
++	int started;
++	int source;             /* 1 = SDAM 存的电量，2 = 开路电压查表 */
++};
++
++static inline int
++pg_soc_from_voltage(const struct pg_state *s, int mv, int ma)
++{
++	/* 开路电压 ≈ 端电压 - 充电电流 × 内阻（放电时 ma 为负，端电压低于开路电压） */
++	int ocv_uv = mv * 1000 - (int)((int64_t)ma * s->rbat_mohm);
++	return pg_ocv_to_soc(ocv_uv, PG_TEMP_DC, ma > 0);
++}
++
++static inline void
++pg_set_soc(struct pg_state *s, int soc_cpct)
++{
++	if (soc_cpct < 0) {
++		soc_cpct = 0;
++	}
++	if (soc_cpct > 10000) {
++		soc_cpct = 10000;
++	}
++	s->charge_uah = (int64_t)soc_cpct * s->fcc_mah / 10;   /* mAh × 0.01% × 1000 µAh / 100 */
++}
++
++static inline int
++pg_soc(const struct pg_state *s)
++{
++	if (s->fcc_mah <= 0) {
++		return 0;
++	}
++	return (int)(s->charge_uah * 10 / s->fcc_mah);
++}
++
++/*
++ * 开机。sdam_valid/sdam_soc：SDAM 0xb146/0xb147；rbat_mohm：0xb14a；learned_mah：0xb168
++ * （读不到填 0）。返回初始电量（0.01%）。
++ */
++static inline int
++pg_start(struct pg_state *s, int mv, int ma, int sdam_valid, int sdam_soc,
++    int rbat_mohm, int learned_mah)
++{
++	int fcc = pg_fcc(PG_TEMP_DC, 0);
++	s->fcc_mah = (learned_mah >= fcc * 6 / 10 && learned_mah <= fcc * 11 / 10) ? learned_mah : fcc;
++	s->rbat_mohm = (rbat_mohm >= 30 && rbat_mohm <= 600) ? rbat_mohm : PG_DEFAULT_RBAT_MOHM;
++	s->rest_ms = 0;
++	int vsoc = pg_soc_from_voltage(s, mv, ma);
++	int d = sdam_soc * 100 - vsoc;
++	if (sdam_valid == 1 && sdam_soc >= 0 && sdam_soc <= 100 &&
++	    d <= PG_SDAM_TRUST * 100 && d >= -PG_SDAM_TRUST * 100) {
++		pg_set_soc(s, sdam_soc * 100);
++		s->source = 1;
++	} else {
++		pg_set_soc(s, vsoc);
++		s->source = 2;
++	}
++	s->started = 1;
++	return pg_soc(s);
++}
++
++/* 每次采样调用一次。dt_ms：距上次的时间；full：充电器报充满。返回显示的百分比 0..100。 */
++static inline unsigned
++pg_update(struct pg_state *s, int mv, int ma, unsigned dt_ms, int charging, int full)
++{
++	if (!s->started) {
++		return 0;
++	}
++	/* 一次最多积 10 分钟：睡眠或卡顿后不让一个异常电流积出大跳变 */
++	if (dt_ms > 600000u) {
++		dt_ms = 600000u;
++	}
++	s->charge_uah += (int64_t)ma * dt_ms / 3600;   /* mA × ms / 3600 = µAh */
++	if (ma < PG_REST_MA && ma > -PG_REST_MA) {
++		s->rest_ms = s->rest_ms + dt_ms > PG_REST_MS * 4u ? PG_REST_MS * 4u : s->rest_ms + dt_ms;
++	} else {
++		s->rest_ms = 0;
++	}
++	if (s->rest_ms >= PG_REST_MS) {
++		int target = pg_soc_from_voltage(s, mv, ma);
++		pg_set_soc(s, pg_soc(s) + (target - pg_soc(s)) / 8);
++	}
++	if (full) {
++		pg_set_soc(s, 10000);
++	}
++	int soc = pg_soc(s);
++	if (soc < 0) {
++		pg_set_soc(s, 0);
++		soc = 0;
++	}
++	if (soc > 10000) {
++		pg_set_soc(s, 10000);
++		soc = 10000;
++	}
++	unsigned pct = (unsigned)((soc + 50) / 100);
++	if (charging && !full && pct > 99) {
++		pct = 99;
++	}
++	if (!charging && mv > 0 && mv < PG_CUTOFF_MV && pct > 1) {
++		pct = 1;
++	}
++	return pct;
++}
++
++#endif /* PICASSO_GAUGE_H */
+--- /dev/null
++++ b/bsd/dev/picasso_gauge_lut.h
+@@ -0,0 +1,153 @@
++/*
++ * 由 tools/picasso-battery-lut.py 从原厂设备树的
++ * qcom,4226072_Xiaomi_G7ANVTBM4P_4500mAh 节点生成，不要手改。
++ */
++#define PG_ROWS 56
++#define PG_V1_COLS 5
++#define PG_V2_COLS 6
++#define PG_FCC1_COLS 5
++#define PG_FCC2_COLS 6
++/* 行：电量，单位 0.01%（10000 = 100%），从高到低 */
++static const int16_t pg_rows[PG_ROWS] = {
++	10000, 9800, 9600, 9400, 9200, 9000, 8800, 8600, 8400, 8200, 8000, 7800, 7600, 7400,
++	7200, 7000, 6800, 6600, 6400, 6200, 6000, 5800, 5600, 5400, 5200, 5000, 4800, 4600,
++	4400, 4200, 4000, 3800, 3600, 3400, 3200, 3000, 2800, 2600, 2400, 2200, 2000, 1800,
++	1600, 1400, 1200, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100, 0,
++};
++/* qcom,pc-temp-v1-lut（原厂 lookup_soc_ocv 在充电时用）：列为温度 °C，数据为 OCV，单位 0.1 mV */
++static const int16_t pg_v1_cols[PG_V1_COLS] = {
++	0, 10, 25, 40, 50,
++};
++static const uint16_t pg_v1[PG_ROWS * PG_V1_COLS] = {
++	43640, 43742, 43820, 43841, 43852,
++	43422, 43530, 43616, 43622, 43624,
++	43175, 43306, 43394, 43399, 43404,
++	42915, 43069, 43166, 43176, 43182,
++	42670, 42828, 42929, 42949, 42955,
++	42438, 42586, 42689, 42720, 42725,
++	42211, 42344, 42451, 42488, 42495,
++	41991, 42111, 42212, 42252, 42264,
++	41775, 41892, 41981, 42021, 42035,
++	41566, 41679, 41756, 41793, 41808,
++	41363, 41465, 41535, 41570, 41582,
++	41165, 41250, 41319, 41352, 41360,
++	40972, 41045, 41105, 41137, 41141,
++	40784, 40858, 40903, 40931, 40930,
++	40581, 40674, 40709, 40729, 40727,
++	40345, 40470, 40518, 40533, 40532,
++	40111, 40243, 40319, 40340, 40342,
++	39938, 40042, 40124, 40152, 40157,
++	39802, 39899, 39954, 39976, 39982,
++	39668, 39771, 39813, 39823, 39827,
++	39531, 39595, 39654, 39663, 39667,
++	39387, 39345, 39413, 39446, 39459,
++	39210, 39114, 39144, 39190, 39203,
++	38965, 38952, 38963, 38993, 39000,
++	38758, 38817, 38839, 38854, 38856,
++	38656, 38713, 38731, 38736, 38734,
++	38585, 38631, 38630, 38624, 38620,
++	38522, 38560, 38539, 38521, 38516,
++	38464, 38485, 38453, 38429, 38423,
++	38412, 38414, 38372, 38344, 38336,
++	38362, 38351, 38299, 38268, 38258,
++	38315, 38294, 38235, 38198, 38186,
++	38272, 38243, 38179, 38136, 38122,
++	38235, 38197, 38129, 38079, 38060,
++	38202, 38158, 38086, 38030, 38005,
++	38170, 38120, 38044, 37982, 37950,
++	38142, 38088, 38004, 37931, 37889,
++	38106, 38052, 37962, 37877, 37825,
++	38047, 37993, 37903, 37809, 37748,
++	37962, 37904, 37816, 37722, 37655,
++	37866, 37802, 37715, 37620, 37550,
++	37749, 37688, 37603, 37509, 37438,
++	37613, 37554, 37474, 37381, 37310,
++	37449, 37388, 37310, 37220, 37143,
++	37302, 37239, 37166, 37081, 37012,
++	37213, 37142, 37070, 36993, 36935,
++	37184, 37119, 37043, 36968, 36911,
++	37166, 37098, 37029, 36949, 36893,
++	37147, 37080, 37012, 36932, 36875,
++	37109, 37045, 36973, 36884, 36817,
++	36927, 36846, 36755, 36642, 36546,
++	36488, 36410, 36323, 36210, 36109,
++	35916, 35838, 35748, 35643, 35536,
++	35138, 35054, 34964, 34858, 34753,
++	33901, 33819, 33742, 33654, 33539,
++	30000, 30000, 30000, 30000, 30000,
++};
++/* qcom,pc-temp-v2-lut（放电时用） */
++static const int16_t pg_v2_cols[PG_V2_COLS] = {
++	-10, 0, 10, 25, 40, 50,
++};
++static const uint16_t pg_v2[PG_ROWS * PG_V2_COLS] = {
++	43875, 43850, 43830, 43815, 43765, 43750,
++	43550, 43535, 43556, 43557, 43511, 43495,
++	43246, 43239, 43292, 43305, 43263, 43247,
++	42968, 42966, 43037, 43060, 43022, 43006,
++	42714, 42715, 42793, 42823, 42789, 42775,
++	42469, 42470, 42552, 42587, 42557, 42544,
++	42227, 42225, 42314, 42352, 42323, 42311,
++	41991, 41984, 42078, 42118, 42089, 42078,
++	41759, 41746, 41847, 41888, 41860, 41849,
++	41530, 41507, 41620, 41662, 41633, 41622,
++	41312, 41285, 41398, 41438, 41409, 41398,
++	41121, 41093, 41186, 41217, 41189, 41178,
++	40938, 40912, 40978, 40999, 40973, 40963,
++	40724, 40704, 40771, 40793, 40766, 40756,
++	40473, 40469, 40565, 40596, 40567, 40553,
++	40205, 40233, 40361, 40400, 40372, 40359,
++	39903, 40007, 40160, 40194, 40178, 40173,
++	39599, 39788, 39963, 39993, 39991, 39994,
++	39387, 39583, 39771, 39822, 39821, 39825,
++	39239, 39390, 39585, 39678, 39673, 39670,
++	39101, 39202, 39391, 39512, 39505, 39497,
++	38953, 39008, 39167, 39271, 39270, 39266,
++	38805, 38820, 38942, 39013, 39018, 39019,
++	38654, 38663, 38767, 38822, 38829, 38832,
++	38494, 38528, 38624, 38667, 38678, 38681,
++	38358, 38405, 38498, 38536, 38549, 38552,
++	38264, 38281, 38385, 38423, 38436, 38438,
++	38188, 38169, 38284, 38324, 38336, 38337,
++	38119, 38089, 38192, 38234, 38244, 38244,
++	38056, 38030, 38107, 38151, 38159, 38157,
++	38000, 37981, 38031, 38075, 38082, 38079,
++	37949, 37936, 37957, 38003, 38014, 38011,
++	37901, 37895, 37892, 37937, 37951, 37947,
++	37854, 37859, 37846, 37876, 37886, 37879,
++	37808, 37829, 37814, 37822, 37822, 37809,
++	37762, 37795, 37779, 37765, 37749, 37728,
++	37713, 37751, 37740, 37702, 37655, 37619,
++	37662, 37697, 37696, 37634, 37552, 37500,
++	37604, 37637, 37638, 37561, 37464, 37407,
++	37540, 37568, 37563, 37483, 37387, 37332,
++	37466, 37487, 37474, 37396, 37306, 37252,
++	37369, 37381, 37366, 37298, 37217, 37160,
++	37255, 37253, 37241, 37186, 37114, 37053,
++	37143, 37103, 37094, 37047, 36972, 36913,
++	37044, 36963, 36963, 36928, 36862, 36801,
++	36963, 36870, 36890, 36871, 36816, 36761,
++	36925, 36835, 36866, 36860, 36803, 36753,
++	36885, 36802, 36844, 36840, 36790, 36739,
++	36837, 36755, 36808, 36813, 36768, 36711,
++	36762, 36674, 36733, 36736, 36690, 36619,
++	36577, 36475, 36510, 36463, 36397, 36289,
++	36182, 36065, 36016, 35953, 35905, 35790,
++	35582, 35458, 35364, 35300, 35268, 35139,
++	34732, 34607, 34479, 34393, 34394, 34261,
++	33365, 33219, 33123, 33054, 33081, 32922,
++	28583, 28570, 28114, 28120, 28771, 28597,
++};
++/* qcom,fcc1-temp-lut（充电）/ fcc2-temp-lut（放电）：满电容量 mAh 随温度 */
++static const int16_t pg_fcc1_cols[PG_FCC1_COLS] = {
++	0, 10, 25, 40, 50,
++};
++static const int16_t pg_fcc1[PG_FCC1_COLS] = {
++	4352, 4428, 4500, 4530, 4544,
++};
++static const int16_t pg_fcc2_cols[PG_FCC2_COLS] = {
++	-10, 0, 10, 25, 40, 50,
++};
++static const int16_t pg_fcc2[PG_FCC2_COLS] = {
++	4486, 4491, 4503, 4515, 4505, 4504,
++};
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -116,8 +116,9 @@ sp_read_allowed(unsigned sid, unsigned peripheral)
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	if (sid == 2) {
++		/* picasso：0xb1 = QG 的 SDAM（qcom,qg-sdam@b100），MIUI 关机时存的电量等，只读 */
+ 		return peripheral == 0x10 || peripheral == 0x11 || peripheral == 0x12 ||
+-		       peripheral == 0x13 || peripheral == 0x48;
++		       peripheral == 0x13 || peripheral == 0x48 || peripheral == 0xb1;
+ 	}
+ 	if (sid == SP_WLED_SID) {
+ 		return peripheral == SP_WLED_CTRL || peripheral == SP_WLED_SINK;
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -2,6 +2,9 @@
+  * Built-in iOS battery bring-up service. Default: 100%, AC, not charging.
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
++ * picasso：默认就读 PM7250B（sweetbattery=0 回到固定 100%）。百分比由
++ * bsd/dev/picasso_gauge.h 算：开机用 MIUI 存在 QG SDAM 里的电量（和电压对得上时）或
++ * 4500 mAh 电池曲线查表，之后按电流积分，静置时向曲线修正。容量按 4500 mAh 发布。
+  * See report.md for binary evidence, register provenance and integration.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+@@ -15,6 +18,12 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" uint64_t mach_absolute_time(void);
++extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
++/* picasso：电量计算法（纯函数，tools/picasso-gauge-test.c 测过） */
++#include "../../../bsd/dev/picasso_gauge.h"
++/* picasso：qcom,nom-batt-capacity-mah（G7ANVTBM4P 4500 mAh） */
++#define SWEET_BATTERY_DESIGN_MAH 4500u
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -28,6 +37,8 @@ private:
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	struct pg_state fGauge;         /* picasso */
++	uint64_t fLastSample;           /* mach_absolute_time of the last gauge update */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -36,7 +47,6 @@ private:
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+-	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -52,6 +62,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	bzero(&fGauge, sizeof(fGauge));
++	fLastSample = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -101,11 +113,11 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (picasso DT nominal=4500). powerd computes C*100/M. */
++	const unsigned capacity = (SWEET_BATTERY_DESIGN_MAH * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(SWEET_BATTERY_DESIGN_MAH);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +131,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", SWEET_BATTERY_DESIGN_MAH);
++	putNumber("DesignCapacity", SWEET_BATTERY_DESIGN_MAH);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +149,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, SWEET_BATTERY_DESIGN_MAH, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,7 +166,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM7250B / estimated SOC" : "static fallback",
++		    measured ? "PM7250B / QG-curve gauge" : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -183,25 +195,6 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ 	return false;
+ }
+ 
+-unsigned
+-SweetBattery::estimatePercent(unsigned mv)
+-{
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+-	if (mv <= volts[0]) {
+-		return soc[0];
+-	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
+-		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
+-		}
+-	}
+-	return 100;
+-}
+ 
+ void
+ SweetBattery::poll(void)
+@@ -242,7 +235,33 @@ SweetBattery::poll(void)
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	/* picasso：QG 曲线 + 库仑计（bsd/dev/picasso_gauge.h） */
++	uint64_t now = mach_absolute_time();
++	unsigned percent;
++	if (!fGauge.started) {
++		uint8_t sv = 0, ssoc = 0, rlo = 0, rhi = 0, clo = 0, chi = 0;
++		bool sdam = !sweet_spmi_read(2, 0xb146, &sv) && !sweet_spmi_read(2, 0xb147, &ssoc);
++		bool rbat = !sweet_spmi_read(2, 0xb14a, &rlo) && !sweet_spmi_read(2, 0xb14b, &rhi);
++		bool cap = !sweet_spmi_read(2, 0xb168, &clo) && !sweet_spmi_read(2, 0xb169, &chi);
++		int start = pg_start(&fGauge, (int)mv, ma, sdam ? sv : 0, sdam ? ssoc : -1,
++		    rbat ? (rhi << 8 | rlo) : 0, cap ? (chi << 8 | clo) : 0);
++		IOLog("SWEET BATTERY: gauge start %d.%02d%% from %s (SDAM valid=%u soc=%u rbat=%u mOhm cap=%u mAh) "
++		    "fcc=%d mAh %umV %dmA\n", start / 100, start % 100,
++		    fGauge.source == 1 ? "SDAM" : "OCV curve", sdam ? sv : 0, sdam ? ssoc : 0,
++		    rbat ? (rhi << 8 | rlo) : 0, cap ? (chi << 8 | clo) : 0, fGauge.fcc_mah, mv, ma);
++		percent = (unsigned)((start + 50) / 100);
++		if (full) {
++			percent = 100;
++		}
++	} else {
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(now - fLastSample, &ns);
++		percent = pg_update(&fGauge, (int)mv, currentValid ? ma : 0,
++		    (unsigned)(ns / 1000000u), charging, full);
++	}
++	fLastSample = now;
++	putNumber("SweetBatterySOCSource", (UInt32)fGauge.source);
++	publish(percent, mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
+ 
+@@ -262,7 +281,7 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	int real = 1;	/* picasso：默认读 PM7250B；sweetbattery=0 回到固定 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */

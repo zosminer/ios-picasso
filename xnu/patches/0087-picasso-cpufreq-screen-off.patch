@@ -1,0 +1,197 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/picasso_touch.c			standard
+ bsd/dev/picasso_vib.c			standard
+ bsd/dev/picasso_backlight.c		standard
++bsd/dev/picasso_cpufreq.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/picasso_cpufreq.c
+@@ -0,0 +1,146 @@
++/*
++ * picasso（红米 K30 5G，SM7250）CPU 调频：熄屏时把三个频率域都降到最低档，亮屏时恢复。
++ *
++ * 硬件：原厂设备树 qcom,cpufreq-hw，compatible "qcom,cpufreq-hw"（不是 EPSS），三个频率域：
++ *   freq-domain0 0x18323000（cpu0-5，A55）、freq-domain1 0x18325800（cpu6）、freq-domain2 0x18327800（cpu7）。
++ * 寄存器照小米开源内核 picasso-r-oss 的 drivers/cpufreq/qcom-cpufreq-hw.c（cpufreq_qcom_std_offsets）：
++ *   0x000 ENABLE（位 0 = 硬件调频已启用）、0x110 + 32*i 频率表、0x114 + 32*i 电压表、0x920 PERF_STATE（档位号）。
++ *   频率表一项：位 31:30 时钟源（0 = 备用时钟 300 MHz）、位 18:16 可用核心数、位 7:0 倍数（× 19.2 MHz）；
++ *   连续两项频率相同表示表结束；核心数小于该域核心数的是加速档（boost），这里不用。
++ * 电压由硬件（OSM）跟着档位自己调，过热限频也是硬件做，这里只写档位号，和 Linux 一样。
++ *
++ * boot-args：
++ *   picassocpufreq=0   只打印频率表，不改档位
++ *   picassocpufreq=1   （默认）熄屏降到最低档，亮屏回到开机时 ABL 设的档位（不会比开机时更高）
++ *   picassocpufreq=2   亮屏用最高的非加速档（界面更快，更耗电、更热），熄屏最低档
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void picasso_cpufreq_init(void);
++void picasso_cpufreq_display(int on);
++
++#define PC_DOMAINS      3
++#define PC_ENABLE       0x000u
++#define PC_FREQ_LUT     0x110u
++#define PC_PERF_STATE   0x920u
++#define PC_ROW          32u
++#define PC_MAX_ROWS     40u
++#define PC_XO_KHZ       19200u
++#define PC_ALT_KHZ      300000u
++
++static const struct {
++	uint32_t pa;
++	unsigned cores;
++	const char *name;
++} pc_dom[PC_DOMAINS] = {
++	{0x18323000u, 6, "cpu0-5"},
++	{0x18325800u, 1, "cpu6"},
++	{0x18327800u, 1, "cpu7"},
++};
++
++static struct {
++	bool ready;
++	int mode;
++	vm_offset_t va[PC_DOMAINS];
++	unsigned rows[PC_DOMAINS];      /* 有效档位数 */
++	unsigned top[PC_DOMAINS];       /* 最高的非加速档 */
++	unsigned boot[PC_DOMAINS];      /* 开机时的档位 */
++	unsigned khz[PC_DOMAINS][PC_MAX_ROWS];
++} pc;
++
++static uint32_t
++pc_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pc_set(unsigned d, unsigned index)
++{
++	if (index >= pc.rows[d]) {
++		return;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(pc.va[d] + PC_PERF_STATE) = index;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++void
++picasso_cpufreq_display(int on)
++{
++	if (!pc.ready || pc.mode == 0) {
++		return;
++	}
++	for (unsigned d = 0; d < PC_DOMAINS; ++d) {
++		unsigned idx = !on ? 0u : (pc.mode == 2 ? pc.top[d] : pc.boot[d]);
++		pc_set(d, idx);
++	}
++	printf("PICASSO CPUFREQ: display %s -> %u/%u/%u MHz\n", on ? "on" : "off",
++	    pc.khz[0][on ? (pc.mode == 2 ? pc.top[0] : pc.boot[0]) : 0] / 1000u,
++	    pc.khz[1][on ? (pc.mode == 2 ? pc.top[1] : pc.boot[1]) : 0] / 1000u,
++	    pc.khz[2][on ? (pc.mode == 2 ? pc.top[2] : pc.boot[2]) : 0] / 1000u);
++}
++
++void
++picasso_cpufreq_init(void)
++{
++	static bool started;
++	int mode = 1;
++	if (started) {
++		return;
++	}
++	started = true;
++	(void)PE_parse_boot_argn("picassocpufreq", &mode, sizeof(mode));
++	pc.mode = (mode >= 0 && mode <= 2) ? mode : 1;
++	for (unsigned d = 0; d < PC_DOMAINS; ++d) {
++		pc.va[d] = ml_io_map(pc_dom[d].pa, 0x1000);
++		if (!pc.va[d]) {
++			printf("PICASSO CPUFREQ: map %s failed\n", pc_dom[d].name);
++			return;
++		}
++		if (!(pc_rd(pc.va[d], PC_ENABLE) & 1u)) {
++			printf("PICASSO CPUFREQ: %s hardware DCVS not enabled; off\n", pc_dom[d].name);
++			return;
++		}
++		unsigned prev = 0, n = 0, top = 0;
++		for (unsigned i = 0; i < PC_MAX_ROWS; ++i) {
++			uint32_t v = pc_rd(pc.va[d], PC_FREQ_LUT + i * PC_ROW);
++			unsigned src = v >> 30, lval = v & 0xffu, cc = (v >> 16) & 7u;
++			unsigned khz = src ? PC_XO_KHZ * lval : PC_ALT_KHZ;
++			if (i > 0 && khz == prev) {
++				break;          /* 表结束 */
++			}
++			pc.khz[d][i] = khz;
++			if (cc == pc_dom[d].cores) {
++				top = i;        /* 加速档的核心数比该域少 */
++			}
++			prev = khz;
++			n = i + 1;
++		}
++		uint32_t cur = pc_rd(pc.va[d], PC_PERF_STATE);
++		pc.rows[d] = n;
++		pc.top[d] = top;
++		pc.boot[d] = cur < n ? cur : top;
++		printf("PICASSO CPUFREQ: %s %u levels %u..%u MHz, top non-boost %u MHz, boot level %u (%u MHz)\n",
++		    pc_dom[d].name, n, pc.khz[d][0] / 1000u, n ? pc.khz[d][n - 1] / 1000u : 0,
++		    pc.khz[d][top] / 1000u, cur, cur < n ? pc.khz[d][cur] / 1000u : 0);
++		if (n < 2 || pc.khz[d][0] < 100000u || pc.khz[d][top] > 3500000u) {
++			printf("PICASSO CPUFREQ: %s table looks wrong; off\n", pc_dom[d].name);
++			return;
++		}
++	}
++	pc.ready = true;
++	if (pc.mode == 2) {
++		picasso_cpufreq_display(1);
++	}
++	printf("PICASSO CPUFREQ: ready, mode %d (0 log only, 1 screen-off low, 2 also screen-on max)\n",
++	    pc.mode);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@ extern void sweet_touch_init(void);
+ extern void picasso_touch_init(void);
+ extern void picasso_vib_init(void);
+ extern void picasso_backlight_init(void);
++extern void picasso_cpufreq_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -668,6 +669,8 @@ sweet_ufs_init(void)
+ 	picasso_vib_init();
+ 	/* picasso：PM8150L WLED5 LCD 背光（bsd/dev/picasso_backlight.c） */
+ 	picasso_backlight_init();
++	/* picasso：熄屏时 CPU 降到最低档（bsd/dev/picasso_cpufreq.c） */
++	picasso_cpufreq_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void picasso_backlight_power(int on);        /* bsd/dev/picasso_backlight.c */
++extern "C" void picasso_cpufreq_display(int on);       /* bsd/dev/picasso_cpufreq.c */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -549,6 +550,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			IOLockUnlock(fFB->fLock);
+ 			/* picasso：LCD 的背光不会因为画面变黑而熄灭，真正关掉它（bsd/dev/picasso_backlight.c） */
+ 			picasso_backlight_power(off ? 0 : 1);
++			/* picasso：熄屏时 CPU 降到最低档，亮屏恢复 */
++			picasso_cpufreq_display(off ? 0 : 1);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
+ 		}
+ 		break;

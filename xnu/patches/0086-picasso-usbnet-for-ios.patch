@@ -1,0 +1,193 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,6 +44,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
++extern void SweetUSBNetPublish(const char *interface, const uint8_t *address);	/* iokit/Kernel/arm/SweetUSBNet.cpp */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -717,6 +718,8 @@ ud_if_create(void)
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	/* picasso：给 ue0 挂上 IOKit 的 IONetworkInterface，iOS 的 configd 才会用它（iokit/Kernel/arm/SweetUSBNet.cpp） */
++	SweetUSBNetPublish("ue0", ud_phone_mac);
+ }
+ 
+ static void
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)                 /* SWEET takes no hold for it (IOStartIOKit.cpp) */
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,7 +188,17 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET (from ios-topaz 0128, also ported by the other picasso port): no IOKit daemon
++	 * ever reports that it has launched (no kexts to manage), so this hold kept the registry
++	 * root busy forever: IOKit never quiesced, configd's InterfaceNamer never said "quiet",
++	 * and every client that lists network interfaces waited for that at boot.
++	 */
++	if (false) {
++#else
+ 	if (OSKext::iokitDaemonAvailable()) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetUSBNet.cpp
+@@ -0,0 +1,129 @@
++/*
++ * picasso：让 iOS 看见 USB 网卡 ue0。
++ *
++ * sweet 的 USB 设备模式（sweetusb=2，bsd/dev/sweet_usb.c）在内核里建了以太网接口 ue0，
++ * 电脑能 ping 通 192.168.7.2，但 iOS 自己不用它：SystemConfiguration 的
++ * SCNetworkInterfaceCopyAll 只列出 IOKit 里类名为 IONetworkInterface 的对象（configd 源码
++ * SCNetworkInterface.c），ue0 背后没有这样的对象，configd 就不给它建网络服务，也就不会
++ * 用它做默认路由和 DNS。
++ *
++ * 做法照 ios-sapphire 0150（移植自 HackiOS 的 RedwoodWLAN.cpp，在 iOS 16 上让 Wi-Fi en0 被识别）：
++ * 平台下挂一个控制器（带 IOMACAddress），控制器下挂一个 IONetworkInterface，属性与
++ * IONetworkingFamily 的同名属性一致：IOInterfaceType 6（IFT_ETHER）、前缀 ue、单元 0、
++ * BSD Name ue0。控制器不是 IO80211Controller 等特殊类，configd 就把它当普通以太网。
++ * 两个类都只有属性，没有用户客户端。
++ * boot-arg sweetusbnet=0 不发布（只保留内核里的 ue0）。
++ */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <pexpert/pexpert.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern "C" void SweetUSBNetPublish(const char *interface, const uint8_t *address);
++
++/* IONetworkingFamily 的类名；本内核没有那个 kext，这里只要名字（configd 按类名匹配） */
++class IONetworkInterface : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class SweetUSBEthernetController : public IOService
++{
++	OSDeclareDefaultStructors(SweetUSBEthernetController);
++};
++OSDefineMetaClassAndStructors(SweetUSBEthernetController, IOService);
++
++class SweetUSBNetworkInterface : public IONetworkInterface
++{
++	OSDeclareDefaultStructors(SweetUSBNetworkInterface);
++};
++OSDefineMetaClassAndStructors(SweetUSBNetworkInterface, IONetworkInterface);
++
++static IOService *
++sweet_usbnet_attach(IOService *service, IOService *provider, const char *name)
++{
++	if (service == NULL || !service->attach(provider)) {
++		OSSafeReleaseNULL(service);
++		return NULL;
++	}
++	service->setName(name);
++	if (!service->start(provider)) {
++		service->detach(provider);
++		service->release();
++		return NULL;
++	}
++	service->registerService();
++	return service;
++}
++
++static void
++sweet_usbnet_number(IOService *s, const char *key, unsigned long long v)
++{
++	OSNumber *n = OSNumber::withNumber(v, 32);
++	if (n) {
++		s->setProperty(key, n);
++		n->release();
++	}
++}
++
++/* ue0 建好后调用一次（bsd/dev/sweet_usb.c 的 ud_if_create） */
++void
++SweetUSBNetPublish(const char *interface, const uint8_t *address)
++{
++	static bool done;
++	int enabled = 1;
++	(void)PE_parse_boot_argn("sweetusbnet", &enabled, sizeof(enabled));
++	if (done || !enabled || interface == NULL || address == NULL) {
++		return;
++	}
++	done = true;
++	size_t len = strnlen(interface, 16);
++	if (len < 3 || len > 15 || interface[len - 1] < '0' || interface[len - 1] > '9') {
++		IOLog("SWEET USBNET: bad interface name\n");
++		return;
++	}
++	char prefix[16];
++	strlcpy(prefix, interface, len);        /* 去掉最后一位数字 */
++	IOService *platform = IOService::getPlatform();
++	SweetUSBEthernetController *controller = OSTypeAlloc(SweetUSBEthernetController);
++	SweetUSBNetworkInterface *netif = OSTypeAlloc(SweetUSBNetworkInterface);
++	if (platform == NULL || controller == NULL || netif == NULL ||
++	    !controller->init() || !netif->init()) {
++		OSSafeReleaseNULL(controller);
++		OSSafeReleaseNULL(netif);
++		IOLog("SWEET USBNET: cannot create the services\n");
++		return;
++	}
++	OSData *mac = OSData::withBytes(address, 6);
++	if (mac) {
++		controller->setProperty("IOMACAddress", mac);
++		mac->release();
++	}
++	controller->setProperty("IOBuiltin", false);
++	controller = (SweetUSBEthernetController *)sweet_usbnet_attach(controller, platform,
++	    "SweetUSBEthernetController");
++	if (controller == NULL) {
++		netif->release();
++		IOLog("SWEET USBNET: the controller did not start\n");
++		return;
++	}
++	netif->setProperty("IOInterfaceName", interface);
++	netif->setProperty("BSD Name", interface);
++	netif->setProperty("IOInterfaceNamePrefix", prefix);
++	sweet_usbnet_number(netif, "IOInterfaceType", 6);       /* IFT_ETHER */
++	sweet_usbnet_number(netif, "IOInterfaceUnit", (unsigned long long)(interface[len - 1] - '0'));
++	sweet_usbnet_number(netif, "IOMaxTransferUnit", 1500);
++	netif->setProperty("IOBuiltin", false);
++	if (sweet_usbnet_attach(netif, controller, "SweetUSBNetworkInterface") == NULL) {
++		IOLog("SWEET USBNET: the interface did not start\n");
++	} else {
++		netif->release();
++		IOLog("SWEET USBNET: %s published as IONetworkInterface (prefix %s)\n", interface, prefix);
++	}
++	controller->release();
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetUSBNet.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp

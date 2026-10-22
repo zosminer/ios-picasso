@@ -26,6 +26,9 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+  network         picasso：SystemConfiguration preferences.plist 里的 "USB Ethernet"
+                  服务（ue0 手动 192.168.7.2/24，网关 192.168.7.1，DNS 1.1.1.1 8.8.8.8）；
+                  已有 preferences.plist 时不动
 """
 import glob, os, plistlib, shutil, sys
 
@@ -122,6 +125,45 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+# picasso：USB 网卡 ue0 的网络服务（内核补丁 0086 让 configd 看见 ue0 之后才起作用）。
+# 不写的话 configd 会给新的以太网接口默认用 DHCP；电脑那边没有 DHCP 服务器，
+# 手机内核设好的 192.168.7.2 也可能被清掉。这里手动配成 192.168.7.2/24，网关是电脑 192.168.7.1，
+# 电脑上开 NAT 后手机就能上网（tools/sweet-usbnet.sh）。键名照 configd 的 genSCPreferences.c。
+USBNET_SET = '9E1C5B2A-0F3D-4C7E-9A61-5357454E4554'
+USBNET_SERVICE = '6A2D9C4F-8B1E-4F35-A7D0-5553424E4554'
+def network(root):
+    path = os.path.join(root, 'private/var/preferences/SystemConfiguration/preferences.plist')
+    if os.path.exists(path):
+        print('network: preferences.plist exists, left alone')
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    service = {
+        'UserDefinedName': 'USB Ethernet',
+        'Interface': {'DeviceName': 'ue0', 'Hardware': 'Ethernet', 'Type': 'Ethernet',
+                      'UserDefinedName': 'USB Ethernet'},
+        'IPv4': {'ConfigMethod': 'Manual', 'Addresses': ['192.168.7.2'],
+                 'SubnetMasks': ['255.255.255.0'], 'Router': '192.168.7.1'},
+        'IPv6': {'ConfigMethod': 'Automatic'},
+        'DNS': {'ServerAddresses': ['1.1.1.1', '8.8.8.8']},
+        'Proxies': {'ExceptionsList': ['*.local', '169.254/16'], 'FTPPassive': 1},
+    }
+    prefs = {
+        '__VERSION__': 20191120,     # NETWORK_CONFIGURATION_VERSION
+        'CurrentSet': '/Sets/' + USBNET_SET,
+        'NetworkServices': {USBNET_SERVICE: service},
+        'Sets': {USBNET_SET: {
+            'UserDefinedName': 'Automatic',
+            'Network': {
+                'Global': {'IPv4': {'ServiceOrder': [USBNET_SERVICE]}},
+                'Service': {USBNET_SERVICE: {'__LINK__': '/NetworkServices/' + USBNET_SERVICE}},
+            },
+        }},
+        'System': {'System': {'ComputerName': 'iPhone', 'HostName': 'iPhone'}},
+    }
+    save(path, prefs, 0, 0, 0o644, plistlib.FMT_XML)
+    print('network: USB Ethernet ue0 192.168.7.2/24 via 192.168.7.1')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -130,6 +172,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    network(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
