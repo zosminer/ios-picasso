@@ -1,0 +1,1399 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/picasso_touch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/picasso_touch.c
+@@ -0,0 +1,1007 @@
++/*
++ * picasso（红米 K30 5G，SM7250）触控屏：Novatek NT36672C（屏幕触控一体 TDDI），
++ * 接在 QUP wrapper1 的 SE7（GENI SPI，0x984000，片选 0，模式 0，8 位）。
++ *
++ * 这颗芯片没有闪存，每次上电都要由主机把固件下载进它的 SRAM，否则不报点。
++ * 固件来自原厂内核（CONFIG_EXTRA_FIRMWARE 内置的 novatek_nt36672c_g7a_fw01/02/03.bin），
++ * 由 tools/mkadt.py --touch-fw=目录 放进 ADT 的 /picasso-touch 节点（fw01/fw02/fw03
++ * 和 panel-fw 对照表）；shim 从 ABL 命令行取面板型号（qcom,mdss_dsi_g7a_37_02_0a_...）
++ * 并追加 boot-arg picassopanel=37_02_0a，这里按对照表选固件。
++ *
++ * 流程照搬厂商驱动（MiCode picasso-r-oss nt36xxx.c / nt36xxx_fw_update.c）：
++ *   复位脚拉低 -> eng reset -> 复位脚拉高 -> 10 ms -> 读芯片 ID
++ *   -> 硬件 CRC 方式下载固件 -> 等复位状态 -> 读固件信息 -> 报点（含 WDT/ESD 恢复）。
++ * SPI 用 FIFO 轮询（不用 DMA/GSI，不碰 SMMU）；中断脚 GPIO5 只用 TLMM 的边沿锁存位
++ * 轮询，不接 GIC。电源随屏幕（ABL 已点亮），这里不碰任何 PMIC/稳压器。
++ * 寄存器来源：原厂设备树、gcc-lito.c、pinctrl-lito.c、spi-geni-qcom.c、qcom-geni-se.c。
++ *
++ * boot-args（屏幕日志只能用英文，下面的打印都是英文）：
++ *   picassotouch=0        关闭（默认 1）
++ *   picassotouchdelay=N   开机 N 秒后才开始（默认 30）；万一总线访问卡死，日志已先落盘
++ *   picassotouchfw=N      强制用 fw0N，不看面板型号
++ *   picassotouchkhz=N     SPI 速率上限 kHz，1000..5000（默认 5000 = 厂商 spi-max-frequency）
++ *   picassotouchirq=0     不用中断脚，固定每 10 ms 读一帧
++ *   picassotouchlog=1     打印每次按下/抬起
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "picasso_touch_nvt.h"
++
++/* osfmk/arm/machine_routines.h 里有，但没有导出给 BSD 层 */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++/* Mach MIG 声明，BSD 的 thread.h 不包含 */
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void picasso_touch_init(void);
++
++/* GCC：wrapper1 的时钟投票（gcc-lito.c：core_2x 18、core 19、m_ahb 20、s_ahb 21、s1 23） */
++#define PT_GCC_PA        0x00100000u
++#define PT_GCC_SIZE      0x00060000u
++#define PT_GCC_VOTE      0x52008u
++#define PT_GCC_VOTE_MASK ((0x0fu << 18) | (1u << 23))
++#define PT_RCG           0x18140u    /* gcc_qupv3_wrap1_s1_clk_src（= 全局 SE7） */
++#define PT_RCG_DFSR      0x14u
++#define PT_RCG_PERF(l)   (0x1cu + 4u * (l))
++#define PT_XO_KHZ        19200u
++/* TLMM：gpio4/5 在 EAST 块，gpio6..9（SPI MISO/MOSI/CLK/CS，功能 qup11）在 WEST 块 */
++#define PT_EAST_PA       0x0f900000u
++#define PT_WEST_PA       0x0f500000u
++#define PT_GPIO_CFG(n)   ((uint32_t)(n) * 0x1000u)
++#define PT_GPIO_IO(n)    (PT_GPIO_CFG(n) + 4u)
++#define PT_GPIO_ICFG(n)  (PT_GPIO_CFG(n) + 8u)
++#define PT_GPIO_ISTS(n)  (PT_GPIO_CFG(n) + 0xcu)
++#define PT_RST           4u
++#define PT_IRQ           5u
++/* SE7 与 wrapper1 公共寄存器 */
++#define PT_SE_PA         0x00984000u
++#define PT_WRAP_PA       0x009c0000u
++
++#define SE_FORCE_DEFAULT 0x020u
++#define SE_OUTPUT_CTRL   0x024u
++#define SE_CGC_CTRL      0x028u
++#define SE_STATUS        0x040u
++#define SE_M_CLK_CFG     0x048u
++#define SE_FIFO_DISABLE  0x064u
++#define SE_FW_REV        0x068u
++#define SE_CLK_SEL       0x07cu
++#define SPI_CPHA         0x224u
++#define SPI_LOOPBACK     0x22cu
++#define SPI_CPOL         0x230u
++#define SPI_DEMUX_INV    0x24cu
++#define SPI_DEMUX_SEL    0x250u
++#define SE_BYTE_GRAN     0x254u
++#define SE_DMA_MODE      0x258u
++#define SPI_TRANS_CFG    0x25cu
++#define SE_TX_PACK0      0x260u
++#define SE_TX_PACK1      0x264u
++#define SPI_WORD_LEN     0x268u
++#define SPI_TX_LEN       0x26cu
++#define SPI_RX_LEN       0x270u
++#define SPI_DELAYS       0x278u
++#define SE_RX_PACK0      0x284u
++#define SE_RX_PACK1      0x288u
++#define SE_M_CMD         0x600u
++#define SE_M_CTRL        0x604u
++#define SE_M_IRQ         0x610u
++#define SE_M_IRQ_EN      0x614u
++#define SE_M_IRQ_CLR     0x618u
++#define SE_S_IRQ_EN      0x644u
++#define SE_S_IRQ_CLR     0x648u
++#define SE_TX_FIFO       0x700u
++#define SE_RX_FIFO       0x780u
++#define SE_TX_STATUS     0x800u
++#define SE_RX_STATUS     0x804u
++#define SE_TX_WM         0x80cu
++#define SE_RX_WM         0x810u
++#define SE_RX_RFR        0x814u
++#define SE_DMA_TX_CLR    0xc44u
++#define SE_DMA_RX_CLR    0xd44u
++#define SE_GSI_EVENT_EN  0xe18u
++#define SE_IRQ_ROUTE     0xe1cu
++#define SE_HW_PARAM0     0xe24u
++#define SE_HW_PARAM1     0xe28u
++#define SE_DMA_GEN_CFG   0xe30u
++
++#define M_DONE           (1u << 0)
++#define M_CANCEL         (1u << 4)
++#define M_ABORT          (1u << 5)
++#define M_ERRORS         ((1u << 1) | (1u << 2) | (1u << 3) | (1u << 24) | (1u << 25) | \
++                          (1u << 28) | (1u << 29))
++#define M_EVENTS         (M_DONE | M_ERRORS | M_CANCEL | M_ABORT | (1u << 26) | (1u << 27))
++#define SPI_TX_ONLY      1u
++#define SPI_FULL_DUPLEX  3u
++#define GENI_PROTO_SPI   1u
++/* se_config_packing(8 位, 每 FIFO 字 4 个, MSB 先发)：与 sweet I2C 的取值相同 */
++#define SE_PACK0         0x0007f8feu
++#define SE_PACK1         0x000ffefeu
++
++#define PT_SCREEN_W      1080u
++#define PT_SCREEN_H      2400u
++/* 固件分块写：每次 SPI 传输最多 1 KiB 数据（厂商一次 63 KiB）；关中断时间约 2 ms */
++#define PT_CHUNK         1024u
++#define PT_MAX_RECOVERY  20u
++
++static struct {
++	vm_offset_t gcc, east, west, se, wrap;
++	bool started, dead, log, irq_seen;
++	int use_irq;
++	unsigned tx_depth, rx_depth, khz, spi_khz, recoveries, timeouts;
++	uint32_t clk_sel, clk_div, last_irq;
++	const struct nvt_trim *chip;
++	char fw_name[8];
++	struct nvt_fw fw;
++	unsigned xmax, ymax;
++	uint32_t active;
++	int x[NVT_MAX_FINGERS], y[NVT_MAX_FINGERS];
++} pt;
++static int pt_sleep_chan;
++
++static uint32_t
++pt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pt_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++pt_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&pt_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static uint64_t
++pt_ms_to_abs(unsigned ms)
++{
++	uint64_t abs;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &abs);
++	return abs;
++}
++
++static bool
++pt_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++{
++	for (unsigned i = 0; i < 5000; ++i) {
++		if (!(pt_rd(base, off) & mask)) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* TLMM 配置：func 复用功能，pull 0 无/1 下拉/3 上拉，drive 毫安（2..16） */
++static void
++pt_gpio(vm_offset_t tile, unsigned pin, unsigned func, unsigned pull, unsigned drive_ma,
++    bool out, bool high)
++{
++	uint32_t cfg = pt_rd(tile, PT_GPIO_CFG(pin));
++	if (out) {
++		/* 先设好输出电平再打开输出（复位脚低有效） */
++		pt_wr(tile, PT_GPIO_IO(pin), (pt_rd(tile, PT_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= (func << 2) | pull | ((drive_ma / 2u - 1u) << 6) | (out ? 0x200u : 0u);
++	pt_wr(tile, PT_GPIO_CFG(pin), cfg);
++}
++
++/* ---- 时钟 ---- */
++
++static bool
++pt_clocks(void)
++{
++	pt_wr(pt.gcc, PT_GCC_VOTE, pt_rd(pt.gcc, PT_GCC_VOTE) | PT_GCC_VOTE_MASK);
++	uint32_t dfs = pt_rd(pt.gcc, PT_RCG + PT_RCG_DFSR);
++	printf("PICASSO TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    pt_rd(pt.gcc, PT_GCC_VOTE), pt_rd(pt.gcc, PT_RCG), pt_rd(pt.gcc, PT_RCG + 4u), dfs);
++	unsigned src_khz = 0;
++	int level = -1;
++	if (dfs & 1u) {
++		/* DFS：SE 的 CLK_SEL 选档。只用以 XO 为源、不带 M/N 的档位，不改档位表。 */
++		for (unsigned l = 0; l < 8; ++l) {
++			uint32_t cfg = pt_rd(pt.gcc, PT_RCG + PT_RCG_PERF(l));
++			unsigned hid = cfg & 0x1fu;
++			unsigned r = hid ? PT_XO_KHZ * 2u / (hid + 1u) : PT_XO_KHZ;
++			printf("PICASSO TOUCH: dfs level %u cfg=%#x\n", l, cfg);
++			if (((cfg >> 8) & 7u) == 0 && ((cfg >> 12) & 3u) == 0 && level < 0) {
++				level = (int)l;
++				src_khz = r;
++			}
++		}
++		if (level < 0) {
++			printf("PICASSO TOUCH: no XO-sourced DFS level; need clock integration\n");
++			return false;
++		}
++	} else {
++		/* 非 DFS：XO 源、分频 1 => 19.2 MHz。不碰 PLL、不改电压。 */
++		uint32_t cfg = pt_rd(pt.gcc, PT_RCG + 4u);
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		pt_wr(pt.gcc, PT_RCG + 4u, cfg);
++		pt_wr(pt.gcc, PT_RCG, pt_rd(pt.gcc, PT_RCG) | 1u);
++		if (!pt_wait_clear(pt.gcc, PT_RCG, 1u)) {
++			printf("PICASSO TOUCH: RCG update timeout\n");
++			return false;
++		}
++		level = 0;
++		src_khz = PT_XO_KHZ;
++	}
++	/* m_ahb、s_ahb（硬件门控时跳过）、core、core_2x、s1 的分支时钟必须已开 */
++	const uint32_t branches[] = {0x18004, 0x18008, 0x23138, 0x23140, 0x1813c};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (branches[i] == 0x18008 && (pt_rd(pt.gcc, branches[i]) & 2u)) {
++			continue;
++		}
++		if (!pt_wait_clear(pt.gcc, branches[i], 1u << 31)) {
++			printf("PICASSO TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
++			    pt_rd(pt.gcc, branches[i]));
++			return false;
++		}
++	}
++	/* QUPv3 1.0 的 SPI 要 2 倍过采样（spi-geni-qcom.c） */
++	uint32_t ver = pt_rd(pt.wrap, 4);
++	unsigned os = (((ver >> 28) & 0xfu) == 1u && ((ver >> 16) & 0xfffu) == 0) ? 2u : 1u;
++	unsigned div = (src_khz + os * pt.khz - 1u) / (os * pt.khz);
++	if (div == 0) {
++		div = 1;
++	}
++	if (div > 0xfffu) {
++		div = 0xfffu;
++	}
++	pt.clk_sel = (uint32_t)level;
++	pt.clk_div = div;
++	pt.spi_khz = src_khz / div / os;
++	if (pt.spi_khz == 0) {
++		pt.spi_khz = 1;
++	}
++	printf("PICASSO TOUCH: qupv3 hw=%#x level=%d src=%u kHz div=%u os=%u -> spi %u kHz\n",
++	    ver, level, src_khz, div, os, pt.spi_khz);
++	return true;
++}
++
++/* ---- GENI SPI（FIFO 轮询）---- */
++
++static bool
++pt_se_init(void)
++{
++	uint32_t fw = pt_rd(pt.se, SE_FW_REV);
++	uint32_t hw0 = pt_rd(pt.se, SE_HW_PARAM0), hw1 = pt_rd(pt.se, SE_HW_PARAM1);
++	uint32_t fifo_off = pt_rd(pt.se, SE_FIFO_DISABLE) & 1u;
++	pt.tx_depth = (hw0 >> 16) & 0x3fu;
++	pt.rx_depth = (hw1 >> 16) & 0x3fu;
++	printf("PICASSO TOUCH: se7 fw=%#x proto=%u fifo_disable=%u status=%#x tx=%#x rx=%#x\n",
++	    fw, (fw >> 8) & 0xffu, fifo_off, pt_rd(pt.se, SE_STATUS), hw0, hw1);
++	if (((fw >> 8) & 0xffu) != GENI_PROTO_SPI) {
++		printf("PICASSO TOUCH: SE7 has no SPI firmware loaded; stopping\n");
++		return false;
++	}
++	if (fifo_off) {
++		printf("PICASSO TOUCH: SE7 is GSI-only (FIFO disabled); GPI DMA not implemented\n");
++		return false;
++	}
++	if (((hw0 >> 24) & 0x3fu) != 32u || ((hw1 >> 24) & 0x3fu) != 32u ||
++	    pt.tx_depth < 4 || pt.rx_depth < 4) {
++		printf("PICASSO TOUCH: unexpected FIFO geometry; stopping\n");
++		return false;
++	}
++	if (pt_rd(pt.se, SE_STATUS) & 1u) {
++		printf("PICASSO TOUCH: SE7 already busy; stopping\n");
++		return false;
++	}
++	/* geni_se_init + FIFO 模式；SE 中断不送 GIC，全部轮询 */
++	pt_wr(pt.se, SE_CGC_CTRL, pt_rd(pt.se, SE_CGC_CTRL) | 0x7fu);
++	pt_wr(pt.se, SE_DMA_GEN_CFG, pt_rd(pt.se, SE_DMA_GEN_CFG) | 0x0fu);
++	pt_wr(pt.se, SE_OUTPUT_CTRL, 0x7f);
++	pt_wr(pt.se, SE_FORCE_DEFAULT, 1);
++	pt_wr(pt.se, SE_IRQ_ROUTE, 0);
++	pt_wr(pt.se, SE_GSI_EVENT_EN, 0);
++	pt_wr(pt.se, SE_DMA_MODE, 0);
++	pt_wr(pt.se, SE_RX_WM, 0);
++	pt_wr(pt.se, SE_RX_RFR, pt.rx_depth - 2u);
++	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	pt_wr(pt.se, SE_S_IRQ_CLR, 0xffffffffu);
++	pt_wr(pt.se, SE_DMA_TX_CLR, 0xffffffffu);
++	pt_wr(pt.se, SE_DMA_RX_CLR, 0xffffffffu);
++	pt_wr(pt.se, SE_S_IRQ_EN, 0);
++	pt_wr(pt.se, SE_M_IRQ_EN, M_EVENTS);
++	/* setup_fifo_params：模式 0、片选 0、不反相、无额外延时、8 位字 */
++	pt_wr(pt.se, SPI_LOOPBACK, pt_rd(pt.se, SPI_LOOPBACK) & ~3u);
++	pt_wr(pt.se, SPI_DEMUX_SEL, 0);
++	pt_wr(pt.se, SPI_CPHA, pt_rd(pt.se, SPI_CPHA) & ~1u);
++	pt_wr(pt.se, SPI_CPOL, pt_rd(pt.se, SPI_CPOL) & ~4u);
++	pt_wr(pt.se, SPI_DEMUX_INV, 0);
++	pt_wr(pt.se, SE_CLK_SEL, pt.clk_sel & 7u);
++	pt_wr(pt.se, SE_M_CLK_CFG, (pt.clk_div << 4) | 1u);
++	pt_wr(pt.se, SPI_DELAYS, 0);
++	pt_wr(pt.se, SPI_WORD_LEN, (pt_rd(pt.se, SPI_WORD_LEN) & ~0x3ffu) | (8u - 4u));
++	pt_wr(pt.se, SE_TX_PACK0, SE_PACK0);
++	pt_wr(pt.se, SE_TX_PACK1, SE_PACK1);
++	pt_wr(pt.se, SE_RX_PACK0, SE_PACK0);
++	pt_wr(pt.se, SE_RX_PACK1, SE_PACK1);
++	pt_wr(pt.se, SE_BYTE_GRAN, 0);
++	pt_wr(pt.se, SPI_TRANS_CFG, pt_rd(pt.se, SPI_TRANS_CFG) & ~1u);
++	pt_wr(pt.se, SE_TX_WM, 0);
++	if (pt_rd(pt.se, SE_TX_PACK0) != SE_PACK0 || pt_rd(pt.se, SE_RX_PACK1) != SE_PACK1 ||
++	    pt_rd(pt.se, SE_M_CLK_CFG) != ((pt.clk_div << 4) | 1u)) {
++		printf("PICASSO TOUCH: SE7 register readback mismatch; stopping\n");
++		return false;
++	}
++	if ((pt_rd(pt.se, SE_TX_STATUS) & 0x0fffffffu) || (pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu)) {
++		printf("PICASSO TOUCH: inherited FIFO data; stopping\n");
++		return false;
++	}
++	return true;
++}
++
++/* 先 cancel，不行再 abort（handle_fifo_timeout）；收不干净就停用驱动 */
++static void
++pt_abort(void)
++{
++	bool done = false;
++	pt_wr(pt.se, SE_M_CTRL, 4u);
++	for (unsigned i = 0; i < 2000 && !done; ++i) {
++		done = (pt_rd(pt.se, SE_M_IRQ) & (M_CANCEL | M_DONE)) != 0;
++		delay(1);
++	}
++	if (!done) {
++		pt_wr(pt.se, SE_M_CTRL, 2u);
++		for (unsigned i = 0; i < 2000 && !done; ++i) {
++			done = (pt_rd(pt.se, SE_M_IRQ) & M_ABORT) != 0;
++			delay(1);
++		}
++	}
++	for (unsigned i = 0; i < 64 && (pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu); ++i) {
++		(void)pt_rd(pt.se, SE_RX_FIFO);
++	}
++	pt_wr(pt.se, SE_TX_WM, 0);
++	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	if (!done || (pt_rd(pt.se, SE_STATUS) & 1u) || (pt_rd(pt.se, SE_TX_STATUS) & 0x0fffffffu)) {
++		pt.dead = true;
++		printf("PICASSO TOUCH: SPI abort failed status=%#x irq=%#x tx=%#x; stopping\n",
++		    pt_rd(pt.se, SE_STATUS), pt_rd(pt.se, SE_M_IRQ), pt_rd(pt.se, SE_TX_STATUS));
++	}
++}
++
++static inline uint8_t
++pt_txbyte(const uint8_t *hdr, unsigned nh, const uint8_t *data, unsigned nd, unsigned i)
++{
++	if (i < nh) {
++		return hdr[i];
++	}
++	i -= nh;
++	return i < nd ? data[i] : 0;
++}
++
++/*
++ * 一次 SPI 传输，片选全程有效。线上共 len 字节：先 hdr[0..nh)，再 data[0..nd)，其余补 0。
++ * rx 非空时全双工，收到的 len 字节存进 rx。传输期间关中断（最长约 2 ms），
++ * 保证 FIFO 不会因为线程被抢占而溢出或断流。
++ */
++static int
++pt_spi(const uint8_t *hdr, unsigned nh, const uint8_t *data, unsigned nd, uint8_t *rx, unsigned len)
++{
++	if (pt.dead || !len || len > PT_CHUNK + 8u) {
++		return EIO;
++	}
++	if (!pt_wait_clear(pt.se, SE_STATUS, 1u)) {
++		pt.dead = true;
++		printf("PICASSO TOUCH: SE7 stuck busy; stopping\n");
++		return EBUSY;
++	}
++	int err = ETIMEDOUT;
++	unsigned sent = 0, got = 0;
++	boolean_t ie = ml_set_interrupts_enabled(FALSE);
++	pt_wr(pt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	pt_wr(pt.se, SPI_TX_LEN, len);
++	if (rx) {
++		pt_wr(pt.se, SPI_RX_LEN, len);
++	}
++	pt_wr(pt.se, SE_M_CMD, (rx ? SPI_FULL_DUPLEX : SPI_TX_ONLY) << 27);
++	/* 线上时间的 2 倍再加 5 ms（1 MHz、1 KiB 时约 21 ms） */
++	uint64_t deadline = mach_absolute_time() +
++	    pt_ms_to_abs(5u + (2u * 8u * len) / pt.spi_khz);
++	for (;;) {
++		uint32_t irq = pt_rd(pt.se, SE_M_IRQ);
++		pt.last_irq = irq;
++		if (irq & M_ERRORS) {
++			err = EIO;
++			break;
++		}
++		if (sent < len) {
++			uint32_t used = pt_rd(pt.se, SE_TX_STATUS) & 0x0fffffffu;
++			while (used < pt.tx_depth && sent < len) {
++				uint32_t w = 0;
++				for (unsigned j = 0; j < 4 && sent < len; ++j, ++sent) {
++					w |= (uint32_t)pt_txbyte(hdr, nh, data, nd, sent) << (8u * j);
++				}
++				pt_wr(pt.se, SE_TX_FIFO, w);
++				++used;
++			}
++		}
++		if (rx) {
++			uint32_t wc = pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu;
++			while (wc-- && got < len) {
++				uint32_t w = pt_rd(pt.se, SE_RX_FIFO);
++				for (unsigned j = 0; j < 4 && got < len; ++j) {
++					rx[got++] = (uint8_t)(w >> (8u * j));
++				}
++			}
++		}
++		if (irq & M_DONE) {
++			/* DONE 之后再收一次尾巴，并重新采样错误位 */
++			if (rx) {
++				uint32_t wc = pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu;
++				while (wc-- && got < len) {
++					uint32_t w = pt_rd(pt.se, SE_RX_FIFO);
++					for (unsigned j = 0; j < 4 && got < len; ++j) {
++						rx[got++] = (uint8_t)(w >> (8u * j));
++					}
++				}
++			}
++			irq = pt_rd(pt.se, SE_M_IRQ);
++			pt.last_irq = irq;
++			if (irq & M_ERRORS) {
++				err = EIO;
++				break;
++			}
++			pt_wr(pt.se, SE_M_IRQ_CLR, irq);
++			if (sent == len && (!rx || got == len) &&
++			    !(pt_rd(pt.se, SE_RX_STATUS) & 0x1ffffffu)) {
++				ml_set_interrupts_enabled(ie);
++				pt.timeouts = 0;
++				return 0;
++			}
++			err = EIO;
++			break;
++		}
++		if (mach_absolute_time() > deadline) {
++			break;
++		}
++	}
++	pt_abort();
++	ml_set_interrupts_enabled(ie);
++	/* 连续超时说明 SE 根本没在出时钟：停用，免得每 10 ms 关一次长中断 */
++	if (err == ETIMEDOUT && ++pt.timeouts >= 3 && !pt.dead) {
++		pt.dead = true;
++		printf("PICASSO TOUCH: 3 SPI timeouts in a row (irq=%#x tx=%u/%u rx=%u); stopping\n",
++		    pt.last_irq, sent, len, got);
++	}
++	return err;
++}
++
++/* ---- Novatek 寄存器访问（nt36xxx.c 的 CTP_SPI_READ/WRITE、nvt_set_page、nvt_write_addr） ---- */
++
++static int
++nvt_page(uint32_t addr)
++{
++	const uint8_t h[3] = {0xff, (uint8_t)(addr >> 15), (uint8_t)(addr >> 7)};
++	return pt_spi(h, 3, NULL, 0, NULL, 3);
++}
++
++/* 写：首字节 = 页内偏移 | 0x80 */
++static int
++nvt_write(uint32_t addr, const uint8_t *data, unsigned n)
++{
++	int err = nvt_page(addr);
++	if (err) {
++		return err;
++	}
++	const uint8_t h = (uint8_t)((addr & 0x7fu) | 0x80u);
++	return pt_spi(&h, 1, data, n, NULL, n + 1u);
++}
++
++static int
++nvt_write1(uint32_t addr, uint8_t v)
++{
++	return nvt_write(addr, &v, 1);
++}
++
++/* 读：首字节 = 页内偏移，之后一个空字节，数据从第 3 个字节开始 */
++static int
++nvt_read(uint32_t addr, uint8_t *out, unsigned n)
++{
++	uint8_t rx[NVT_POINT_LEN + 8];
++	if (n > NVT_POINT_LEN + 6u) {
++		return EINVAL;
++	}
++	int err = nvt_page(addr);
++	if (err) {
++		return err;
++	}
++	const uint8_t h = (uint8_t)(addr & 0x7fu);
++	err = pt_spi(&h, 1, NULL, 0, rx, n + 2u);
++	if (!err) {
++		memcpy(out, rx + 2, n);
++	}
++	return err;
++}
++
++static void
++nvt_eng_reset(void)
++{
++	(void)nvt_write1(NVT_ENG_RST_ADDR, 0x5A);
++	pt_sleep(1);
++}
++
++static void
++nvt_bootloader_reset(void)
++{
++	(void)nvt_write1(NVT_SWRST_N8_ADDR, 0x69);
++	pt_sleep(5);
++	(void)nvt_write1(NVT_SPI_RD_FAST_ADDR, 0x00);
++}
++
++/* nvt_ts_check_chip_ver_trim：最多 5 次 */
++static int
++nvt_trim(void)
++{
++	for (unsigned retry = 0; retry < 5 && !pt.dead; ++retry) {
++		uint8_t id[NVT_ID_BYTES] = {0};
++		nvt_bootloader_reset();
++		int err = nvt_read(NVT_CHIP_ID_ADDR, id, sizeof(id));
++		printf("PICASSO TOUCH: chip id err=%d %02x %02x %02x %02x %02x %02x irq=%#x\n",
++		    err, id[0], id[1], id[2], id[3], id[4], id[5], pt.last_irq);
++		if (!err) {
++			int t = nvt_trim_match(id);
++			if (t >= 0) {
++				pt.chip = &nvt_trim_table[t];
++				return 0;
++			}
++		}
++		pt_sleep(10);
++	}
++	return ENODEV;
++}
++
++/* nvt_check_fw_reset_state */
++static int
++nvt_reset_state(uint8_t want, unsigned retries)
++{
++	uint8_t s[5] = {0};
++	for (unsigned i = 0;; ++i) {
++		int err = nvt_read(pt.chip->map->event_buf | NVT_EVT_RESET_DONE, s, sizeof(s));
++		if (!err && s[0] >= want && s[0] <= NVT_RESET_MAX) {
++			return 0;
++		}
++		if (i >= retries || pt.dead) {
++			printf("PICASSO TOUCH: reset state want>=%#x got %02x %02x %02x %02x %02x err=%d\n",
++			    want, s[0], s[1], s[2], s[3], s[4], err);
++			return ETIMEDOUT;
++		}
++		pt_sleep(10);
++	}
++}
++
++/* nvt_write_sram：一个分区写 size+1 字节，按 PT_CHUNK 分块，每块重新设页 */
++static int
++nvt_write_part(const struct nvt_part *p)
++{
++	uint32_t sram = p->sram, bin = p->bin, left = p->size + 1u;
++	while (left) {
++		unsigned n = left < PT_CHUNK ? left : PT_CHUNK;
++		int err = nvt_write(sram, pt.fw.data + bin, n);
++		if (err) {
++			return err;
++		}
++		sram += n;
++		bin += n;
++		left -= n;
++	}
++	return 0;
++}
++
++/* nvt_set_bld_crc_bank：目的地址 3 字节、长度（hw_crc 1 为 2 字节，>1 为 3 字节）、期望 CRC 4 字节 */
++static int
++nvt_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size,
++    uint32_t g_addr, uint32_t crc)
++{
++	const uint8_t d[3] = {(uint8_t)sram, (uint8_t)(sram >> 8), (uint8_t)(sram >> 16)};
++	const uint8_t l[3] = {(uint8_t)size, (uint8_t)(size >> 8), (uint8_t)((size >> 16) & 1u)};
++	const uint8_t c[4] = {(uint8_t)crc, (uint8_t)(crc >> 8), (uint8_t)(crc >> 16), (uint8_t)(crc >> 24)};
++	int err = nvt_write(des, d, 3);
++	if (!err) {
++		err = nvt_write(len_addr, l, pt.chip->hw_crc > 1 ? 3u : 2u);
++	}
++	if (!err) {
++		err = nvt_write(g_addr, c, 4);
++	}
++	return err;
++}
++
++/* nvt_download_firmware_hw_crc 的一轮 */
++static int
++nvt_download_once(void)
++{
++	const struct nvt_mmap *m = pt.chip->map;
++	int err = 0;
++	nvt_bootloader_reset();
++	for (unsigned i = 0; i < pt.fw.nparts && !err; ++i) {
++		if (pt.fw.part[i].size) {
++			err = nvt_write_part(&pt.fw.part[i]);
++		}
++	}
++	if (!err) {
++		err = nvt_crc_bank(m->ilm_des, pt.fw.part[0].sram, m->ilm_len, pt.fw.part[0].size,
++		    m->g_ilm_crc, pt.fw.part[0].crc);
++	}
++	if (!err) {
++		err = nvt_crc_bank(m->dlm_des, pt.fw.part[1].sram, m->dlm_len, pt.fw.part[1].size,
++		    m->g_dlm_crc, pt.fw.part[1].crc);
++	}
++	uint8_t v = 0xff;
++	if (!err) {
++		err = nvt_read(m->bld_crc_en, &v, 1);
++	}
++	if (!err) {
++		err = nvt_write1(m->bld_crc_en, v | 0x80u);
++	}
++	if (!err) {
++		err = nvt_write1(m->event_buf | NVT_EVT_RESET_DONE, 0x00);
++	}
++	if (!err) {
++		err = nvt_write1(m->event_buf | NVT_EVT_HOST_CMD, 0xAE);
++	}
++	if (!err) {
++		err = nvt_write1(m->boot_rdy, 1);
++	}
++	if (err) {
++		printf("PICASSO TOUCH: firmware write failed err=%d irq=%#x\n", err, pt.last_irq);
++		return err;
++	}
++	pt_sleep(5);
++	return nvt_reset_state(NVT_RESET_INIT, 10);
++}
++
++/* nvt_read_bld_hw_crc：下载 3 次都失败时打印芯片算出的 CRC */
++static void
++nvt_crc_diag(void)
++{
++	const struct nvt_mmap *m = pt.chip->map;
++	uint8_t f = 0, g[4] = {0}, r[4] = {0}, gd[4] = {0}, rd[4] = {0};
++	(void)nvt_read(m->bld_ilm_dlm_crc, &f, 1);
++	(void)nvt_read(m->g_ilm_crc, g, 4);
++	(void)nvt_read(m->r_ilm_crc, r, 4);
++	(void)nvt_read(m->g_dlm_crc, gd, 4);
++	(void)nvt_read(m->r_dlm_crc, rd, 4);
++	printf("PICASSO TOUCH: crc flags=%#x (done=%u ilm=%u dlm=%u) ilm bin=%#x golden=%#x result=%#x"
++	    " dlm bin=%#x golden=%#x result=%#x\n", f, (f >> 2) & 1u, f & 1u, (f >> 1) & 1u,
++	    pt.fw.part[0].crc, nvt_le32(g), nvt_le32(r), pt.fw.part[1].crc, nvt_le32(gd), nvt_le32(rd));
++}
++
++/* nvt_get_fw_info + nvt_read_pid */
++static void
++nvt_fw_info(void)
++{
++	struct nvt_fwinfo fi;
++	uint8_t d[16];
++	pt.xmax = PT_SCREEN_W;
++	pt.ymax = PT_SCREEN_H;
++	for (unsigned retry = 0; retry < 4; ++retry) {
++		memset(d, 0, sizeof(d));
++		if (!nvt_read(pt.chip->map->event_buf | NVT_EVT_FWINFO, d, sizeof(d)) &&
++		    nvt_parse_fwinfo(d, &fi)) {
++			printf("PICASSO TOUCH: fw ver=%u x_num=%u y_num=%u abs=%ux%u type=%#x\n",
++			    fi.ver, fi.x_num, fi.y_num, fi.xmax, fi.ymax, fi.type);
++			if (fi.xmax >= 100 && fi.ymax >= 100) {
++				pt.xmax = fi.xmax;
++				pt.ymax = fi.ymax;
++			}
++			break;
++		}
++		printf("PICASSO TOUCH: fw info broken (%02x %02x), retry %u\n", d[0], d[1], retry);
++	}
++	uint8_t p[2] = {0};
++	(void)nvt_read(pt.chip->map->event_buf | NVT_EVT_PROJECTID, p, 2);
++	printf("PICASSO TOUCH: pid=%04x, coordinates 0..%u x 0..%u\n",
++	    ((unsigned)p[1] << 8) | p[0], pt.xmax, pt.ymax);
++}
++
++/* 下载 + 等基线校准（nvt_update_firmware + resume 里的 RESET_STATE_REK） */
++static int
++nvt_load(void)
++{
++	int err = ETIMEDOUT;
++	for (unsigned retry = 0; retry < 3 && !pt.dead; ++retry) {
++		uint64_t t0 = mach_absolute_time(), ns;
++		err = nvt_download_once();
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		printf("PICASSO TOUCH: download %s try %u: err=%d in %llu ms\n",
++		    pt.fw_name, retry, err, (unsigned long long)(ns / NSEC_PER_MSEC));
++		if (!err) {
++			break;
++		}
++	}
++	if (err) {
++		if (!pt.dead) {
++			nvt_crc_diag();
++		}
++		return err;
++	}
++	nvt_fw_info();
++	(void)nvt_reset_state(NVT_RESET_REK, 50);
++	return 0;
++}
++
++/* ---- 固件选择（ADT /picasso-touch）---- */
++
++static bool
++pt_pick_fw(void)
++{
++	DTEntry node;
++	void const *prop = NULL;
++	unsigned int size = 0;
++	unsigned force = 0;
++	char panel[16] = "";
++	if (SecureDTLookupEntry(NULL, "/picasso-touch", &node) != kSuccess) {
++		printf("PICASSO TOUCH: no /picasso-touch in the ADT (mkadt.py --touch-fw=DIR)\n");
++		return false;
++	}
++	pt.fw_name[0] = 0;
++	(void)PE_parse_boot_arg_str("picassopanel", panel, sizeof(panel));
++	if (PE_parse_boot_argn("picassotouchfw", &force, sizeof(force)) && force >= 1 && force <= 99) {
++		(void)snprintf(pt.fw_name, sizeof(pt.fw_name), "fw%02u", force);
++		printf("PICASSO TOUCH: panel '%s', firmware forced to %s\n", panel, pt.fw_name);
++	} else if (!panel[0]) {
++		printf("PICASSO TOUCH: no picassopanel boot-arg (shim found no panel name)\n");
++	} else if (SecureDTGetProperty(node, "panel-fw", &prop, &size) != kSuccess ||
++	    !nvt_panel_lookup((const char *)prop, size, panel, pt.fw_name, sizeof(pt.fw_name))) {
++		printf("PICASSO TOUCH: panel '%s' not in the panel-fw table\n", panel);
++	} else {
++		printf("PICASSO TOUCH: panel '%s' -> %s\n", panel, pt.fw_name);
++	}
++	if (!pt.fw_name[0]) {
++		/* 只写 SRAM，选错也不会损坏芯片；不对时用 picassotouchfw=N 换 */
++		strlcpy(pt.fw_name, "fw01", sizeof(pt.fw_name));
++		printf("PICASSO TOUCH: guessing fw01; set picassotouchfw=N if touch does not work\n");
++	}
++	if (SecureDTGetProperty(node, pt.fw_name, &prop, &size) != kSuccess) {
++		printf("PICASSO TOUCH: ADT has no %s\n", pt.fw_name);
++		return false;
++	}
++	int e = nvt_fw_parse((const uint8_t *)prop, size, pt.chip->hw_crc, &pt.fw);
++	printf("PICASSO TOUCH: %s %u bytes, need %#x, ver %u, %u parts (%u info, %u overlay): %s\n",
++	    pt.fw_name, size, pt.fw.need, pt.fw.ver, pt.fw.nparts, pt.fw.ninfo, pt.fw.novly,
++	    nvt_fw_error(e));
++	if (e != NVT_FW_OK) {
++		return false;
++	}
++	for (unsigned i = 0; i < pt.fw.nparts; ++i) {
++		if (pt.fw.part[i].size) {
++			printf("PICASSO TOUCH:  part %u sram=%#x size=%#x bin=%#x crc=%#x\n", i,
++			    pt.fw.part[i].sram, pt.fw.part[i].size + 1u, pt.fw.part[i].bin, pt.fw.part[i].crc);
++		}
++	}
++	return true;
++}
++
++/* ---- 报点 ---- */
++
++static void
++pt_report(uint32_t mask, const int *x, const int *y)
++{
++	for (unsigned id = 0; id < NVT_MAX_FINGERS; ++id) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			if (!(pt.active & bit) || x[id] != pt.x[id] || y[id] != pt.y[id]) {
++				sweet_hid_touch((int)id, 1, x[id], y[id]);
++				if (pt.log && !(pt.active & bit)) {
++					printf("PICASSO TOUCH: finger %u down at %d,%d\n", id, x[id], y[id]);
++				}
++			}
++			pt.x[id] = x[id];
++			pt.y[id] = y[id];
++		} else if (pt.active & bit) {
++			sweet_hid_touch((int)id, 0, pt.x[id], pt.y[id]);
++			if (pt.log) {
++				printf("PICASSO TOUCH: finger %u up\n", id);
++			}
++		}
++	}
++	pt.active = mask;
++}
++
++/* 固件出错后重新下载（厂商 WDT/ESD 恢复都是 nvt_update_firmware） */
++static void
++pt_recover(const char *why)
++{
++	pt_report(0, pt.x, pt.y);
++	if (pt.recoveries >= PT_MAX_RECOVERY) {
++		if (pt.recoveries++ == PT_MAX_RECOVERY) {
++			printf("PICASSO TOUCH: %s, but %u reloads already; no more recovery\n", why,
++			    PT_MAX_RECOVERY);
++		}
++		return;
++	}
++	++pt.recoveries;
++	printf("PICASSO TOUCH: %s; reloading firmware (%u)\n", why, pt.recoveries);
++	(void)nvt_load();
++}
++
++static void
++pt_loop(void)
++{
++	const uint32_t evt = pt.chip->map->event_buf;
++	uint8_t d[NVT_POINT_LEN];
++	unsigned errors = 0, wdt = 0, quiet = 0;
++	bool esd_check = false;
++	uint64_t esd_t = mach_absolute_time();
++	const uint64_t esd_period = pt_ms_to_abs(1500);
++	if (pt.use_irq) {
++		/* GPIO5 上升沿锁存：目标 KPSS(3<<5)、RAW_STATUS_EN(bit4)、边沿(1<<2)、高有效(bit1)；
++		 * bit0 中断使能保持 0，不送 GIC（pinctrl-msm 的 lito 位定义） */
++		uint32_t icfg = pt_rd(pt.east, PT_GPIO_ICFG(PT_IRQ)) & ~0xffu;
++		pt_wr(pt.east, PT_GPIO_ICFG(PT_IRQ), icfg | (3u << 5) | (1u << 4) | (1u << 2) | (1u << 1));
++		pt_wr(pt.east, PT_GPIO_ISTS(PT_IRQ), 0);
++	}
++	printf("PICASSO TOUCH: running, poll 10 ms, irq latch %s\n", pt.use_irq ? "on" : "off");
++	while (!pt.dead) {
++		bool edge = false;
++		if (pt.use_irq && (pt_rd(pt.east, PT_GPIO_ISTS(PT_IRQ)) & 1u)) {
++			pt_wr(pt.east, PT_GPIO_ISTS(PT_IRQ), 0);
++			edge = true;
++			if (!pt.irq_seen) {
++				pt.irq_seen = true;
++				printf("PICASSO TOUCH: first irq edge seen; switching to irq-driven reads\n");
++			}
++		}
++		bool irq_mode = pt.use_irq && pt.irq_seen;
++		/* 中断模式：有边沿才读；按下期间 200 ms 没边沿也补读一次，防止漏掉抬起 */
++		bool want = !irq_mode || edge || (pt.active && ++quiet >= 20);
++		if (want) {
++			quiet = 0;
++			int err = nvt_read(evt, d, sizeof(d));
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("PICASSO TOUCH: read err=%d irq=%#x\n", err, pt.last_irq);
++				}
++				if (errors == 10) {
++					pt_report(0, pt.x, pt.y);
++				}
++			} else {
++				errors = 0;
++				if (nvt_is_wdt_frame(d)) {
++					if (++wdt > 10) {
++						wdt = 0;
++						pt_recover("firmware watchdog reset (0xFD/0xFE frames)");
++						esd_t = mach_absolute_time();
++					}
++				} else {
++					wdt = 0;
++					if (nvt_is_esd_frame(d)) {
++						/* 只有真实中断带来的心跳才算数，旧帧重复读到不算 */
++						if (edge) {
++							esd_check = true;
++							esd_t = mach_absolute_time();
++						}
++					} else {
++						struct nvt_points p;
++						int x[NVT_MAX_FINGERS] = {0}, y[NVT_MAX_FINGERS] = {0};
++						(void)nvt_parse_points(d, pt.xmax, pt.ymax, &p);
++						for (unsigned i = 0; i < NVT_MAX_FINGERS; ++i) {
++							if (p.mask & (1u << i)) {
++								x[i] = (int)nvt_scale(p.x[i], pt.xmax, PT_SCREEN_W);
++								y[i] = (int)nvt_scale(p.y[i], pt.ymax, PT_SCREEN_H);
++							}
++						}
++						if (p.mask) {
++							esd_t = mach_absolute_time();
++						}
++						pt_report(p.mask, x, y);
++					}
++				}
++			}
++		}
++		/* 厂商 ESD 检查：心跳开启后 1.5 s 内既没心跳也没按下 => 固件挂了 */
++		if (irq_mode && esd_check && mach_absolute_time() - esd_t > esd_period) {
++			esd_check = false;
++			pt_recover("no firmware heartbeat for 1.5 s (ESD check)");
++			esd_t = mach_absolute_time();
++		}
++		pt_sleep(10);
++	}
++	pt_report(0, pt.x, pt.y);
++}
++
++static void
++pt_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 30;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("picassotouchdelay", &delay_s, sizeof(delay_s));
++	printf("PICASSO TOUCH: starting in %u s\n", delay_s);
++	pt_sleep(delay_s * 1000u);
++	printf("PICASSO TOUCH: mapping GCC/TLMM/SE7\n");
++	pt.gcc = ml_io_map(PT_GCC_PA, PT_GCC_SIZE);
++	pt.east = ml_io_map(PT_EAST_PA, PT_GPIO_CFG(PT_IRQ + 1));
++	pt.west = ml_io_map(PT_WEST_PA, PT_GPIO_CFG(9 + 1));
++	pt.se = ml_io_map(PT_SE_PA, 0x4000);
++	pt.wrap = ml_io_map(PT_WRAP_PA, 0x2000);
++	if (!pt.gcc || !pt.east || !pt.west || !pt.se || !pt.wrap) {
++		printf("PICASSO TOUCH: MMIO mapping failed\n");
++		goto out;
++	}
++	printf("PICASSO TOUCH: TLMM rst cfg=%#x io=%#x irq cfg=%#x io=%#x cs cfg=%#x\n",
++	    pt_rd(pt.east, PT_GPIO_CFG(PT_RST)), pt_rd(pt.east, PT_GPIO_IO(PT_RST)),
++	    pt_rd(pt.east, PT_GPIO_CFG(PT_IRQ)), pt_rd(pt.east, PT_GPIO_IO(PT_IRQ)),
++	    pt_rd(pt.west, PT_GPIO_CFG(9)));
++	if (!pt_clocks() || !pt_se_init()) {
++		goto out;
++	}
++	/* 原厂 pinctrl：SPI 四根线 qup11、6 mA、无上下拉；中断脚下拉 16 mA；复位脚上拉 16 mA */
++	for (unsigned pin = 6; pin <= 9; ++pin) {
++		pt_gpio(pt.west, pin, 1, 0, 6, false, false);
++	}
++	pt_gpio(pt.east, PT_IRQ, 0, 1, 16, false, false);
++	/* 厂商 probe：复位脚先输出低，eng reset，再拉高，等 10 ms（POR） */
++	pt_gpio(pt.east, PT_RST, 0, 3, 16, true, false);
++	pt_sleep(1);
++	nvt_eng_reset();
++	pt_gpio(pt.east, PT_RST, 0, 3, 16, true, true);
++	pt_sleep(10);
++	if (nvt_trim()) {
++		printf("PICASSO TOUCH: no supported Novatek chip (dead=%d); stopping\n", pt.dead);
++		goto out;
++	}
++	printf("PICASSO TOUCH: chip uses %s, hw_crc=%u\n", pt.chip->name, pt.chip->hw_crc);
++	if (!pt.chip->map) {
++		printf("PICASSO TOUCH: software-checksum download not implemented; stopping\n");
++		goto out;
++	}
++	if (!pt_pick_fw() || nvt_load()) {
++		printf("PICASSO TOUCH: firmware not running; stopping\n");
++		goto out;
++	}
++	pt_loop();
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++picasso_touch_init(void)
++{
++	int enabled = 1;
++	unsigned khz = 5000, log = 0;
++	thread_t thread;
++	if (pt.started) {
++		return;
++	}
++	pt.started = true;
++	pt.use_irq = 1;
++	(void)PE_parse_boot_argn("picassotouch", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("picassotouchirq", &pt.use_irq, sizeof(pt.use_irq));
++	(void)PE_parse_boot_argn("picassotouchkhz", &khz, sizeof(khz));
++	(void)PE_parse_boot_argn("picassotouchlog", &log, sizeof(log));
++	pt.khz = (khz >= 1000 && khz <= 5000) ? khz : 5000;
++	pt.log = log != 0;
++	if (!enabled) {
++		printf("PICASSO TOUCH: disabled (picassotouch=0)\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(pt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("PICASSO TOUCH: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/picasso_touch_nvt.h
+@@ -0,0 +1,357 @@
++/*
++ * picasso（红米 K30 5G）Novatek NT36672C 触控：与硬件无关的纯函数部分。
++ *
++ * 依据小米开源内核 MiCode picasso-r-oss 的
++ * drivers/input/touchscreen/nt36672c/（nt36xxx.c、nt36xxx_fw_update.c、
++ * nt36xxx_mem_map.h）。本文件不包含任何头文件，使用前须已有 uint8_t/uint32_t
++ * 等类型；电脑上可以直接编译做单元测试（tools/picasso-touch-test.c）。
++ */
++#ifndef PICASSO_TOUCH_NVT_H
++#define PICASSO_TOUCH_NVT_H
++
++#define NVT_ID_BYTES     6
++#define NVT_MAX_PARTS    40
++#define NVT_MAX_FINGERS  10
++#define NVT_POINT_LEN    65              /* 厂商 POINT_DATA_LEN */
++#define NVT_SECTOR       4096u
++
++/* 事件缓冲区内的偏移（厂商 SPI_EVENT_MAP） */
++#define NVT_EVT_HOST_CMD      0x50u
++#define NVT_EVT_RESET_DONE    0x60u
++#define NVT_EVT_FWINFO        0x78u
++#define NVT_EVT_PROJECTID     0x9Au
++#define NVT_RESET_INIT        0xA0u      /* 芯片已复位 */
++#define NVT_RESET_REK         0xA1u      /* 基线校准完成后 */
++#define NVT_RESET_MAX         0xAFu
++
++/* 固定地址：nt36xxx.c 与原厂设备树 ts_novatek 节点 */
++#define NVT_ENG_RST_ADDR      0x7FFF80u
++#define NVT_SWRST_N8_ADDR     0x3F0FEu   /* novatek,swrst-n8-addr */
++#define NVT_SPI_RD_FAST_ADDR  0x3F310u   /* novatek,spi-rd-fast-addr */
++#define NVT_CHIP_ID_ADDR      0x1F64Eu   /* 页 0x1F600 + 偏移 0x4E */
++
++/* 下载流程用到的寄存器（nt36xxx_mem_map.h 中的一部分） */
++struct nvt_mmap {
++	uint32_t event_buf, boot_rdy;
++	uint32_t ilm_len, dlm_len, ilm_des, dlm_des;
++	uint32_t g_ilm_crc, g_dlm_crc, r_ilm_crc, r_dlm_crc;
++	uint32_t bld_crc_en, bld_ilm_dlm_crc;
++};
++
++static const struct nvt_mmap nvt_map_nt36675 = {
++	0x22D00, 0x3F10D, 0x3F118, 0x3F130, 0x3F128, 0x3F12C,
++	0x3F100, 0x3F104, 0x3F120, 0x3F124, 0x3F30E, 0x3F133,
++};
++static const struct nvt_mmap nvt_map_nt36672a = {
++	0x21C00, 0x3F10D, 0x3F118, 0x3F130, 0x3F128, 0x3F12C,
++	0x3F100, 0x3F104, 0x3F120, 0x3F124, 0x3F30E, 0x3F133,
++};
++
++/* 芯片 ID 表，顺序与厂商 trim_id_table 相同（先匹配者胜）。
++ * map 为 NULL 表示该芯片走软件校验和下载（hw_crc 0），这里不支持。 */
++struct nvt_trim {
++	uint8_t id[NVT_ID_BYTES], mask[NVT_ID_BYTES];
++	const struct nvt_mmap *map;
++	uint8_t hw_crc;
++	const char *name;
++};
++
++#define NVT_T(a, b, c, d, e, f, ma, mb, mc, md, me, mf, map, crc, name) \
++	{ {a, b, c, d, e, f}, {ma, mb, mc, md, me, mf}, map, crc, name }
++static const struct nvt_trim nvt_trim_table[] = {
++	NVT_T(0x0C, 0xFF, 0xFF, 0x72, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36675, 2, "NT36675-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x75, 0x66, 0x03, 0, 0, 0, 1, 1, 1, &nvt_map_nt36675, 2, "NT36675-map"),
++	NVT_T(0x0B, 0xFF, 0xFF, 0x72, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0B, 0xFF, 0xFF, 0x82, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0B, 0xFF, 0xFF, 0x25, 0x65, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0A, 0xFF, 0xFF, 0x72, 0x65, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0A, 0xFF, 0xFF, 0x72, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0A, 0xFF, 0xFF, 0x82, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0A, 0xFF, 0xFF, 0x70, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0B, 0xFF, 0xFF, 0x70, 0x66, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x0A, 0xFF, 0xFF, 0x72, 0x67, 0x03, 1, 0, 0, 1, 1, 1, &nvt_map_nt36672a, 1, "NT36672A-map"),
++	NVT_T(0x55, 0x00, 0xFF, 0x00, 0x00, 0x00, 1, 1, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0x55, 0x72, 0xFF, 0x00, 0x00, 0x00, 1, 1, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xAA, 0x00, 0xFF, 0x00, 0x00, 0x00, 1, 1, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xAA, 0x72, 0xFF, 0x00, 0x00, 0x00, 1, 1, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x72, 0x67, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x70, 0x66, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x70, 0x67, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x72, 0x66, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36772-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x25, 0x65, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36525-map"),
++	NVT_T(0xFF, 0xFF, 0xFF, 0x76, 0x66, 0x03, 0, 0, 0, 1, 1, 1, 0, 0, "NT36676F-map"),
++};
++#undef NVT_T
++
++/* 返回匹配的表项下标，没有匹配返回 -1 */
++static inline int
++nvt_trim_match(const uint8_t *id)
++{
++	for (unsigned t = 0; t < sizeof(nvt_trim_table) / sizeof(nvt_trim_table[0]); ++t) {
++		unsigned i;
++		for (i = 0; i < NVT_ID_BYTES; ++i) {
++			if (nvt_trim_table[t].mask[i] && id[i] != nvt_trim_table[t].id[i]) {
++				break;
++			}
++		}
++		if (i == NVT_ID_BYTES) {
++			return (int)t;
++		}
++	}
++	return -1;
++}
++
++static inline uint32_t
++nvt_le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* 一个分区：写到芯片 SRAM 的 sram 地址，内容是固件文件 bin 偏移处的 size+1 字节
++ * （厂商在写入时把 size 加 1）；crc 是硬件 CRC 方式的期望值。 */
++struct nvt_part {
++	uint32_t sram, size, bin, crc;
++};
++
++struct nvt_fw {
++	const uint8_t *data;
++	uint32_t size, need;     /* 文件大小；带结束标志的有效长度 */
++	uint8_t ver;             /* 固件版本（有效长度 - 4 KiB 处） */
++	unsigned nparts, ninfo, novly;
++	struct nvt_part part[NVT_MAX_PARTS];
++};
++
++#define NVT_FW_OK          0
++#define NVT_FW_SHORT      -1
++#define NVT_FW_NO_FLAG    -2
++#define NVT_FW_BAD_VER    -3
++#define NVT_FW_NO_HWCRC   -4
++#define NVT_FW_BAD_HEADER -5
++#define NVT_FW_BAD_RANGE  -6
++
++static inline const char *
++nvt_fw_error(int e)
++{
++	switch (e) {
++	case NVT_FW_OK:         return "ok";
++	case NVT_FW_SHORT:      return "file too short";
++	case NVT_FW_NO_FLAG:    return "no NVT/MOD end flag";
++	case NVT_FW_BAD_VER:    return "FW_VER + FW_VER_BAR != 0xFF";
++	case NVT_FW_NO_HWCRC:   return "chip needs software checksum download (unsupported)";
++	case NVT_FW_BAD_HEADER: return "bad bin header";
++	case NVT_FW_BAD_RANGE:  return "partition outside the file";
++	default:                return "?";
++	}
++}
++
++/*
++ * 检查并解析固件文件，等价于厂商 update_firmware_request() 里的
++ * nvt_get_fw_need_write_size()、FW_VER 检查和 nvt_bin_header_parser()（hw_crc 方式），
++ * 另外补上厂商没有做的越界检查。成功返回 NVT_FW_OK。
++ */
++static inline int
++nvt_fw_parse(const uint8_t *d, uint32_t size, unsigned hw_crc, struct nvt_fw *fw)
++{
++	fw->data = d;
++	fw->size = size;
++	fw->need = 0;
++	fw->nparts = fw->ninfo = fw->novly = 0;
++	if (!d || size < NVT_SECTOR) {
++		return NVT_FW_SHORT;
++	}
++	/* 从后往前找以 "NVT" 或 "MOD" 结尾的 4 KiB 扇区 */
++	for (uint32_t i = size / NVT_SECTOR; i > 0; --i) {
++		const uint8_t *f = d + i * NVT_SECTOR - 3;
++		if ((f[0] == 'N' && f[1] == 'V' && f[2] == 'T') ||
++		    (f[0] == 'M' && f[1] == 'O' && f[2] == 'D')) {
++			fw->need = i * NVT_SECTOR;
++			break;
++		}
++	}
++	if (!fw->need) {
++		return NVT_FW_NO_FLAG;
++	}
++	if (fw->need < NVT_SECTOR ||
++	    ((d[fw->need - NVT_SECTOR] + d[fw->need - NVT_SECTOR + 1]) & 0x1ff) != 0xFF) {
++		return NVT_FW_BAD_VER;
++	}
++	fw->ver = d[fw->need - NVT_SECTOR];
++	if (!hw_crc) {
++		return NVT_FW_NO_HWCRC;
++	}
++	/* 头部长度（第 0 个字），信息段从 0x30 起每段 16 字节 */
++	uint32_t end = nvt_le32(d);
++	if (end > size) {
++		return NVT_FW_BAD_HEADER;
++	}
++	unsigned info = 0;
++	for (uint32_t pos = 0x30; pos < end; pos += 0x10) {
++		++info;
++	}
++	unsigned ovly = (d[0x28] & 0x10) ? (d[0x28] & 0x0Fu) : 0;
++	unsigned total = 2u + ovly + info;
++	if (total > NVT_MAX_PARTS || 0x30u + 0x10u * info > size) {
++		return NVT_FW_BAD_HEADER;
++	}
++	for (unsigned l = 0; l < total; ++l) {
++		struct nvt_part *p = &fw->part[l];
++		if (l < 2) {
++			/* ILM、DLM：BIN_addr、SRAM_addr、size 各 4 字节，CRC 在 0x18/0x1C */
++			p->bin = nvt_le32(d + l * 12u);
++			p->sram = nvt_le32(d + 4u + l * 12u);
++			p->size = nvt_le32(d + 8u + l * 12u);
++			p->crc = nvt_le32(d + 0x18u + l * 4u);
++		} else {
++			uint64_t pos;
++			if (l < 2u + info) {
++				pos = 0x30u + 0x10u * (l - 2u);
++			} else {
++				/* 覆盖段的描述放在 DLM 的起始处 */
++				pos = (uint64_t)fw->part[1].bin + 0x10u * (l - 2u - info);
++			}
++			if (pos + 16u > size) {
++				return NVT_FW_BAD_HEADER;
++			}
++			p->sram = nvt_le32(d + pos);
++			p->size = nvt_le32(d + pos + 4u);
++			p->bin = nvt_le32(d + pos + 8u);
++			p->crc = nvt_le32(d + pos + 12u);
++		}
++		/* 厂商检查 BIN_addr + size <= 文件大小；实际要写 size+1 字节，这里按 size+1 查 */
++		if (p->size && ((uint64_t)p->bin + p->size + 1u > size ||
++		    (uint64_t)p->sram + p->size + 1u > 0x800000u)) {
++			return NVT_FW_BAD_RANGE;
++		}
++	}
++	fw->nparts = total;
++	fw->ninfo = info;
++	fw->novly = ovly;
++	return NVT_FW_OK;
++}
++
++/* 固件信息（事件缓冲区 0x78 起 16 字节）：版本与反码校验，坐标最大值是大端 */
++struct nvt_fwinfo {
++	uint8_t ver, x_num, y_num, type;
++	unsigned xmax, ymax;
++};
++
++static inline int
++nvt_parse_fwinfo(const uint8_t *d, struct nvt_fwinfo *fi)
++{
++	if (((d[0] + d[1]) & 0x1ff) != 0xFF) {
++		return 0;
++	}
++	fi->ver = d[0];
++	fi->x_num = d[2];
++	fi->y_num = d[3];
++	fi->xmax = ((unsigned)d[4] << 8) | d[5];
++	fi->ymax = ((unsigned)d[6] << 8) | d[7];
++	fi->type = d[13];
++	return 1;
++}
++
++/* 一帧报点。mask 第 i 位 = 手指 i（芯片 ID i+1）按下 */
++struct nvt_points {
++	uint32_t mask;
++	unsigned x[NVT_MAX_FINGERS], y[NVT_MAX_FINGERS];
++};
++
++/*
++ * 解析事件缓冲区开头 65 字节（厂商 point_data[1..65]）。每个手指 6 字节：
++ * [0] = ID<<3 | 状态（1 进入、2 移动 = 按下），x = [1]<<4 | [3]>>4，y = [2]<<4 | [3]&0xF。
++ * 和厂商一样跳过 ID 为 0 或大于 10、以及坐标超出固件给的最大值的记录。返回按下的手指数。
++ */
++static inline unsigned
++nvt_parse_points(const uint8_t *d, unsigned xmax, unsigned ymax, struct nvt_points *pt)
++{
++	unsigned n = 0;
++	pt->mask = 0;
++	for (unsigned i = 0; i < NVT_MAX_FINGERS; ++i) {
++		const uint8_t *p = d + 6u * i;
++		unsigned id = p[0] >> 3, st = p[0] & 7u;
++		if (id == 0 || id > NVT_MAX_FINGERS || (st != 1u && st != 2u)) {
++			continue;
++		}
++		unsigned x = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned y = ((unsigned)p[2] << 4) | (p[3] & 0x0Fu);
++		if (x > xmax || y > ymax) {
++			continue;
++		}
++		if (!(pt->mask & (1u << (id - 1)))) {
++			++n;
++		}
++		pt->mask |= 1u << (id - 1);
++		pt->x[id - 1] = x;
++		pt->y[id - 1] = y;
++	}
++	return n;
++}
++
++/* 看门狗复位后的帧：前 6 字节都是 0xFD/0xFE（厂商 nvt_wdt_fw_recovery） */
++static inline int
++nvt_is_wdt_frame(const uint8_t *d)
++{
++	for (unsigned i = 0; i < 6; ++i) {
++		if (d[i] != 0xFD && d[i] != 0xFE) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/* 固件的 ESD 心跳帧：前 6 字节都是 0x77（厂商 nvt_fw_recovery） */
++static inline int
++nvt_is_esd_frame(const uint8_t *d)
++{
++	for (unsigned i = 0; i < 6; ++i) {
++		if (d[i] != 0x77) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/* 固件坐标（0..max）换算成屏幕像素（0..screen-1） */
++static inline unsigned
++nvt_scale(unsigned v, unsigned max, unsigned screen)
++{
++	unsigned s = max ? (unsigned)(((uint64_t)v * screen) / ((uint64_t)max + 1u)) : v;
++	return s < screen ? s : screen - 1u;
++}
++
++/*
++ * 在 ADT 的 panel-fw 表里查面板对应的固件属性名。表是若干个以 NUL 结尾的
++ * "面板=属性名" 字符串，例如 "37_02_0a=fw01\0"。找到返回 1，结果写进 out。
++ */
++static inline int
++nvt_panel_lookup(const char *map, unsigned len, const char *panel, char *out, unsigned outlen)
++{
++	unsigned i = 0;
++	if (!outlen) {
++		return 0;
++	}
++	out[0] = 0;
++	while (i < len) {
++		const char *e = map + i;
++		unsigned n = 0;
++		while (i + n < len && e[n]) {
++			++n;
++		}
++		unsigned k = 0;
++		while (panel[k] && k < n && e[k] == panel[k]) {
++			++k;
++		}
++		if (!panel[k] && k < n && e[k] == '=') {
++			unsigned m = 0;
++			for (unsigned j = k + 1; j < n && m + 1 < outlen; ++j) {
++				out[m++] = e[j];
++			}
++			out[m] = 0;
++			return m != 0;
++		}
++		i += n + 1;
++	}
++	return 0;
++}
++
++#endif /* PICASSO_TOUCH_NVT_H */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void picasso_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,8 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	/* picasso：Novatek NT36672C SPI 触控（bsd/dev/picasso_touch.c） */
++	picasso_touch_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }

@@ -3,6 +3,7 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+  [--high-base=0x.. --high-size=0x..] [--touch-fw=DIR | --no-touch-fw]
 """
 import hashlib, os, struct, sys
 
@@ -49,6 +50,40 @@ QEMU_VTIMER_INTID = 27
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'picasso boot manifest').digest()
 
+# picasso：Novatek NT36672C 触控固件（内核 bsd/dev/picasso_touch.c，补丁 0082）。
+# 芯片没有闪存，每次开机都要下载。文件取自原厂 boot.img 内核里 CONFIG_EXTRA_FIRMWARE
+# 内置的三份固件（小米的二进制，不进 git），默认放在 research/picasso-touch/，
+# 也可以用 --touch-fw=目录 指定。
+TOUCH_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/picasso-touch')
+TOUCH_FW = [('fw01', 'novatek_nt36672c_g7a_fw01.bin'),
+            ('fw02', 'novatek_nt36672c_g7a_fw02.bin'),
+            ('fw03', 'novatek_nt36672c_g7a_fw03.bin')]
+# 面板编号（ABL 命令行 mdss_dsi_g7a_XX_XX_XX，shim 转成 boot-arg picassopanel=）对应的固件。
+# 依据：原厂 DisplayDxe 把 37_02_0a / 37_02_0b / 36_02_0c 依次列为 EBBG / EBBG_815 /
+# Tianma 的 NT36672C；原厂设备树 cfg_2（fw03）的 display-maker 是 0x36，
+# cfg_0/cfg_1（fw01/fw02）是 0x37、glass-vendor 0/1。36_02_0c -> fw03 比较可靠；
+# 37_02_0a -> fw01、37_02_0b -> fw02 是推测（厂商实际按面板 lockdown 信息选）。
+# 不对时开机加 picassotouchfw=N 试，改这里不用重编内核。
+TOUCH_PANEL_FW = [('37_02_0a', 'fw01'), ('37_02_0b', 'fw02'), ('36_02_0c', 'fw03')]
+
+
+def touch_node(fw_dir, ph):
+    """/picasso-touch：fw01..fw03 原样放进属性，panel-fw 是 "面板=属性名" 字符串列表。"""
+    props = []
+    for name, fname in TOUCH_FW:
+        path = os.path.join(fw_dir, fname)
+        if os.path.exists(path):
+            props.append((name, open(path, 'rb').read()))
+        else:
+            print(f'warning: {path} missing', file=sys.stderr)
+    if not props:
+        print(f'warning: no touch firmware in {fw_dir}, no /picasso-touch node', file=sys.stderr)
+        return None
+    have = {n for n, _ in props}
+    table = b''.join(cstr(f'{panel}={fw}') for panel, fw in TOUCH_PANEL_FW if fw in have)
+    return node('picasso-touch', [ph(), ('compatible', cstr('novatek,nt36672c-spi')),
+                                  ('panel-fw', table)] + props)
+
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
 # the root identity and /product of the real D22AP device tree. That tree is
@@ -82,8 +117,9 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
-    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+def build(seed=None, qemu=False, highmem=False, touch_fw_dir=TOUCH_FW_DIR):
+    """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
+    touch_fw_dir：picasso 触控固件目录（None = 不放 /picasso-touch）。"""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -234,6 +270,8 @@ def build(seed=None, qemu=False, highmem=False):
     # dram-size we expose, so XNU maps it but never allocates into it.
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
+    touch = touch_node(touch_fw_dir, ph) if touch_fw_dir and not qemu else None
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
@@ -246,17 +284,24 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs])
+       + ([touch] if touch else []))
 
 
 if __name__ == '__main__':
     # picasso：--high-base=0x... / --high-size=0x... 覆盖高位内存段（按诊断 shim 的 DRAM banks 填写）
+    # --touch-fw=目录 指定触控固件目录；--no-touch-fw 不放 /picasso-touch
+    touch_dir = TOUCH_FW_DIR
     for arg in sys.argv:
         if arg.startswith('--high-base='):
             HIGH_PHYS_BASE = int(arg.split('=', 1)[1], 0)
         elif arg.startswith('--high-size='):
             HIGH_MEM_SIZE = int(arg.split('=', 1)[1], 0)
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+        elif arg.startswith('--touch-fw='):
+            touch_dir = arg.split('=', 1)[1]
+        elif arg == '--no-touch-fw':
+            touch_dir = None
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw_dir=touch_dir)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

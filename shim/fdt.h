@@ -7,3 +7,5 @@ int fdt_chosen_u64(uintptr_t fdt, const char *prop, uint64_t *out);
 int fdt_memory_banks(uintptr_t fdt, uint64_t *base, uint64_t *size, int max);
 /* picasso 新增：名字以 prefix 开头的第一个节点的 reg 第一项；找到返回 1。 */
 int fdt_node_reg(uintptr_t fdt, const char *prefix, uint64_t *base, uint64_t *size);
+/* picasso 新增：/chosen/bootargs 里 ABL 选中的 G7A 面板编号（如 "37_02_0a"）；找到返回 1。 */
+int fdt_chosen_panel(uintptr_t fdt, char *out, int outlen);

@@ -25,7 +25,7 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 | 电源键 / 音量下 | PM6150 PON 0x800（SID 0） | PM8150 PON 0x800（SID 0），位 0 / 位 1 | 不变 |
 | 音量上 | PM6150L GPIO2，PPID 0x4c1，寄存器 0xc1xx | **PM8150L GPIO6，PPID 0x4c5，寄存器 0xc5xx** | 已改补丁 0060 |
 | 电量计 / 充电器 | PM6150（SID 0） | **PM7250B（SID 2）**：QGauge 0x4800，SMB5 0x1000-0x13ff | 已改补丁 0062（默认仍是固定 100%，sweetbattery=1 才读） |
-| 触屏 | Goodix GT9896，GENI I2C 0xa84000 | **Novatek NT36672C，GENI SPI，QUP SE7 0x984000**，复位 GPIO4，中断 GPIO5，5 MHz | 补丁 0060 触屏 **默认关闭**；驱动未写 |
+| 触屏 | Goodix GT9896，GENI I2C 0xa84000 | **Novatek NT36672C，GENI SPI，QUP SE7 0x984000**，复位 GPIO4，中断 GPIO5，5 MHz | sweet 的 I2C 驱动保持关闭；**新驱动 0082**（见下文“触屏驱动”），默认开启，开机 30 s 后启动 |
 | USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 一个寄存器） | 补丁 0072 USB **默认关闭** |
 | 固定保留区最高处 | ramdump_fb 0xaf000000 | disp_rdump_region 0xac000000-0xad000000 | 0xb0000000-0xfd000000 内无固定保留区（已用脚本核对） |
 
@@ -43,7 +43,8 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   低位与高位两种 ADT 都能生成，关键值已核对。
 - `xnu/patches/`：0010、0012（帧缓冲地址）、0060（音量上 GPIO6；触屏默认关）、0062（电池 SID 2）、0072（USB 默认关）。
   只改行内常量，行数不变。
-- `tools/check-patch-series.py`：按 CI 规则在本机把补丁应用到干净的 xnu-8796.141.3。结果：本仓库 81 个补丁 **全部应用**，
+- `shim/`（0082 配套）：`fdt_chosen_panel()` 读 ABL 选中的面板，loader 追加 `picassopanel=`；`fdt_host_test` 加了面板解析自测。
+- `tools/check-patch-series.py`：按 CI 规则在本机把补丁应用到干净的 xnu-8796.141.3。结果：本仓库 82 个补丁（含 0082）**全部应用**，
   另有 4 个构建脚本自带、针对其他 macOS 版本的补丁被跳过（原版 ios-sweet 跳过的也是这 4 个）。
   打完补丁的源码里 picasso 常量已确认生效。本机检出位置：`../.scratch/xnu-8796-pristine`、`../.scratch/dxb`（不入库）。
 
@@ -54,19 +55,51 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
    （`tools/mkiosroot.sh`）。用户说下载晚点再看。注意这台 Mac 的 `/etc/hosts` 屏蔽了 updates.cdn-apple.com（用户用来挡 macOS 更新），
    不要改 hosts；可用工作区 `../../tools/apple-cdn-dns` 只在构建进程内绕过。Docker 已安装但守护进程没开。
 3. **Bootloader 解锁**（约 7 天后）。
-4. 触屏驱动：Novatek NT36672C 走 SPI。**已确认**要由主机每次开机下载触屏固件：小米官方 picasso 内核
-   `MiCode/Xiaomi_Kernel_OpenSource` 分支 `picasso-r-oss` 的 `drivers/input/touchscreen/nt36672c/`
-   （`BOOT_UPDATE_FIRMWARE 1`，`Boot_Update_Firmware()` → `nvt_download_firmware(_hw_crc)()`，
-   SPI 读写首字节 `addr & 0x7f` / `addr | 0x80`，单次最多 63 KiB）。固件 `novatek_nt36672c_g7a_fw0X.bin`
-   在 /vendor/firmware，非 root 读不到；官方卡刷包里的 `vendor.new.dat.br`（781 MB）可解出。
-   需要新写：GENI SPI 传输（SE7 0x984000）、复位/中断 GPIO、固件下载、触点读取。尚未开始。
+4. 触屏驱动已写完（补丁 0082，见下节），**只做了离线验证**，要等内核编出来、上机才知道能不能用。
+
+### 触屏驱动（补丁 0082，2026-10-22，离线完成，未上机）
+- 新文件 `bsd/dev/picasso_touch.c`（硬件部分）+ `bsd/dev/picasso_touch_nvt.h`（纯函数：芯片 ID 表、固件解析、
+  报点解析、面板对照表查找），`bsd/conf/files` 登记，`sweet_ufs.c` 在 `sweet_touch_init()` 之后调用 `picasso_touch_init()`。
+  流程照搬小米开源驱动 `MiCode/Xiaomi_Kernel_OpenSource` 分支 `picasso-r-oss` 的 `drivers/input/touchscreen/nt36672c/`：
+  复位脚低 → eng reset（0x7FFF80=0x5A）→ 复位脚高 → 10 ms → bootloader reset（0x3F0FE=0x69，0x3F310=0）
+  → 读芯片 ID（0x1F64E，6 字节，查 trim 表）→ 硬件 CRC 方式下载固件 → 等复位状态 0xA0 → 读固件信息 → 等 0xA1
+  → 每 10 ms 读事件缓冲区 65 字节报点，经 `sweet_hid_touch()` 交给 SweetHID。看门狗帧（0xFD/0xFE）和
+  ESD 心跳超时（1.5 s）都会重新下载固件，最多 20 次。
+- SPI：SE7 FIFO 轮询（不用 DMA/GSI，不碰 SMMU），传输期间关中断（最长约 2 ms），固件按 1 KiB 分块写（每块重设页）。
+  要求 SE7 已由 TZ/XBL 加载 SPI 协议固件（proto=1）且 FIFO 没被禁用；不满足就停用并在屏幕上说明原因。
+  时钟：GCC 0x52008 投票位 18-21、23；RCG 0x18140（DFS 时选第一个 XO 源、无 M/N 的档位），SPI 默认 ≤5 MHz。
+  TLMM：gpio4/5 在 EAST 0x0f900000，gpio6-9（qup11）在 WEST 0x0f500000，配置照原厂 pinctrl。
+  中断脚只用 TLMM 的上升沿锁存位轮询（不送 GIC）；看到第一个边沿后才改成“有边沿才读”。
+  **不碰任何 PMIC/稳压器**：触控随屏幕供电，ABL 已点亮。
+- 固件来源：**不在 vendor 分区**（解出的 vendor.img 里 /firmware 只有 MP 测试表），而是原厂 boot.img 内核用
+  CONFIG_EXTRA_FIRMWARE 内置。`tools/picasso-touch-fw.py ../../firmware/V13.0.3.0.SGICNXM/boot.img` 取出到
+  `research/picasso-touch/`（不入库），三份都是 139264 字节，sha256 前缀 fw01 a428d4f8、fw02 9daa0425、fw03 ba210148。
+  `tools/mkadt.py` 默认把它们放进 ADT 的 `/picasso-touch`（属性 fw01/fw02/fw03 + `panel-fw` 对照表），
+  ADT 因此约 420 KB；`--touch-fw=目录` 换目录，`--no-touch-fw` 不放，`--qemu` 不放。
+- 选固件：shim 从 ABL 的 `/chosen/bootargs`（`msm_drm.dsi_display0=qcom,mdss_dsi_g7a_37_02_0a_dsc_video:...`）
+  取面板编号，追加 boot-arg `picassopanel=37_02_0a`，屏幕上显示 `PANEL` 一行。对照表
+  37_02_0a→fw01、37_02_0b→fw02、36_02_0c→fw03：36_02_0c→fw03 有依据（cfg_2 display-maker 0x36），
+  **另外两个是推测**（厂商实际按 lockdown 信息选）。固件只写 SRAM，选错不会损坏芯片；
+  不出点就加 `picassotouchfw=2` 之类换一个。
+- boot-args：`picassotouch=0` 关闭；`picassotouchdelay=N`（默认 30 s）；`picassotouchfw=N`；`picassotouchkhz=1000..5000`；
+  `picassotouchirq=0` 固定轮询；`picassotouchlog=1` 打印按下/抬起。屏幕日志前缀 `PICASSO TOUCH:`。
+- 已验证：`tools/picasso-touch-test.c`（合成数据 + 三份真实固件）全部通过；三份固件都解析为 15 个分区
+  （ILM 0x13a78 字节写到 SRAM 0、DLM 0x4198 字节写到 0x27140、头部 0x100 字节写到 0x27040），结束标志 NVT、
+  版本校验通过；`check-patch-series.py` 82 个补丁全部应用；`validate-repo.py` 通过；驱动用 SDK 内核头做了
+  `-Weverything` 语法检查（无警告），**没做过真正的内核编译**；shim 重新构建，fdt 面板解析自测通过。
+- 未验证/待上机：SE7 是否加载了 SPI 固件、FIFO 是否可用；芯片 ID 实际值（推测命中 NT36675 内存表、hw_crc 2）；
+  GCC/TLMM 是否有 XPU 保护；DFS 档位；面板与固件对应关系；中断脚边沿锁存是否工作；坐标方向（推测与屏幕一致）。
+  上机第一次请录屏/拍照 `PICASSO TOUCH:` 开头的所有行。
 
 ### 下一步（具体动作）
 - 解锁后第一步：`python3 shim/build_macos.py`，`fastboot boot shim/out/shim-boot.img`（只进内存，不写分区）。
   看屏幕：红底文字出现 = 帧缓冲地址正确；记下 "DRAM banks" 各段 base/size 和 "RMTFS base"，据此设置
   `tools/mkadt.py --highmem --high-base= --high-size=`，并确认 RMTFS 不在 0xb0000000-0xfd000000 内。
 - 用户提供 GitHub 账号后：fork、推送 `picasso` 分支、`gh workflow run xnu.yml`，下载 `xnu-kernel` 产物，
-  再 `tools/mkpayload.py`（命令行先用 `cpus=1 sweettouch=0`）+ `shim/build_macos.py PAYLOAD`。
+  再 `tools/mkpayload.py`（命令行先用 `cpus=1`；触屏先加 `picassotouchlog=1`）+ `shim/build_macos.py PAYLOAD`。
+  打包前先跑 `tools/picasso-touch-fw.py`，否则 ADT 里没有触屏固件（mkadt 会警告）。
+- CI 编译 0082 如果报错，先看 `picasso_touch.c` 里 `PE_parse_boot_arg_str`、`delay`、`kernel_thread_start` 的声明
+  （本地只用 SDK 头检查过）。
 - 写入 userdata（会清空 MIUI 数据）前必须再次征得用户同意，并先备份 persist、modemst1/2、fsg、fsc。
 
 ## Agent handoff / active work (2026-10-15, latest)

@@ -133,6 +133,33 @@ const char *loader_boot(uintptr_t dtb)
 	ba->deviceTreeLength = (uint32_t)p->adt_size;
 	for (int i = 0; i < BOOT_LINE_LENGTH; i++)
 		ba->CommandLine[i] = p->cmdline[i];
+	/*
+	 * picasso 新增：把 ABL 选中的面板编号追加成 boot-arg picassopanel=37_02_0a，
+	 * 内核触控驱动（bsd/dev/picasso_touch.c）按它从 ADT 选 Novatek 固件。
+	 */
+	{
+		char panel[16];
+		if (fdt_chosen_panel(dtb, panel, sizeof(panel))) {
+			static const char key[] = " picassopanel=";
+			int n = 0, need = 0;
+			while (n < BOOT_LINE_LENGTH - 1 && ba->CommandLine[n])
+				n++;
+			while (panel[need])
+				need++;
+			if (n + (int)sizeof(key) - 1 + need < BOOT_LINE_LENGTH) {
+				for (int i = 0; key[i]; i++)
+					ba->CommandLine[n++] = key[i];
+				for (int i = 0; panel[i]; i++)
+					ba->CommandLine[n++] = panel[i];
+				ba->CommandLine[n] = 0;
+				con_str("PANEL", panel);
+			} else {
+				con_str("PANEL", "cmdline full, picassopanel not added");
+			}
+		} else {
+			con_str("PANEL", "not found in ABL bootargs");
+		}
+	}
 	ba->memSizeActual = p->mem_size;
 	con_hex2("BOOTARG", "pa=", ba_pa, "top=", top);
 
