@@ -54,9 +54,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
    （`tools/mkiosroot.sh`）。用户说下载晚点再看。注意这台 Mac 的 `/etc/hosts` 屏蔽了 updates.cdn-apple.com（用户用来挡 macOS 更新），
    不要改 hosts；可用工作区 `../../tools/apple-cdn-dns` 只在构建进程内绕过。Docker 已安装但守护进程没开。
 3. **Bootloader 解锁**（约 7 天后）。
-4. 触屏驱动：Novatek NT36672C 是 SPI 接口、通常需要主机每次开机下载触屏固件（`novatek_nt36672c_g7a_fw0X.bin`，
-   在 /vendor/firmware，非 root 读不到；可从官方卡刷包的 vendor 镜像提取）。这是推测，要读 picasso 内核
-   `drivers/input/touchscreen/nt36xxx/` 确认。需要新写 GENI SPI 传输和 Novatek 协议。
+4. 触屏驱动：Novatek NT36672C 走 SPI。**已确认**要由主机每次开机下载触屏固件：小米官方 picasso 内核
+   `MiCode/Xiaomi_Kernel_OpenSource` 分支 `picasso-r-oss` 的 `drivers/input/touchscreen/nt36672c/`
+   （`BOOT_UPDATE_FIRMWARE 1`，`Boot_Update_Firmware()` → `nvt_download_firmware(_hw_crc)()`，
+   SPI 读写首字节 `addr & 0x7f` / `addr | 0x80`，单次最多 63 KiB）。固件 `novatek_nt36672c_g7a_fw0X.bin`
+   在 /vendor/firmware，非 root 读不到；官方卡刷包里的 `vendor.new.dat.br`（781 MB）可解出。
+   需要新写：GENI SPI 传输（SE7 0x984000）、复位/中断 GPIO、固件下载、触点读取。尚未开始。
 
 ### 下一步（具体动作）
 - 解锁后第一步：`python3 shim/build_macos.py`，`fastboot boot shim/out/shim-boot.img`（只进内存，不写分区）。
