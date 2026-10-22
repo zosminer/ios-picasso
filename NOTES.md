@@ -24,9 +24,9 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 | SPMI 仲裁器 | v5，core 0xc440000，obsrvr 0xe600000，cnfg 0xc40a000 | 相同 | 不变 |
 | 电源键 / 音量下 | PM6150 PON 0x800（SID 0） | PM8150 PON 0x800（SID 0），位 0 / 位 1 | 不变 |
 | 音量上 | PM6150L GPIO2，PPID 0x4c1，寄存器 0xc1xx | **PM8150L GPIO6，PPID 0x4c5，寄存器 0xc5xx** | 已改补丁 0060 |
-| 电量计 / 充电器 | PM6150（SID 0） | **PM7250B（SID 2）**：QGauge 0x4800，SMB5 0x1000-0x13ff | 已改补丁 0062（默认仍是固定 100%，sweetbattery=1 才读） |
+| 电量计 / 充电器 | PM6150（SID 0） | **PM7250B（SID 2）**：QGauge 0x4800，SMB5 0x1000-0x13ff | 补丁 0062（默认仍是固定 100%，sweetbattery=1 才读）。2026-10-22 用小米 picasso-r-oss 的 qg-reg.h / qg-util.c / qg-defs.h / smb5-reg.h **逐个核对**了 SweetBattery.cpp 用到的寄存器、位和换算系数（0x4804=0x0d、0x4808 位 0、0x48c0 ×194.637 µV、0x48c2 子类型 3/4 ×152.588/305.176 µA、0x1006/0x1007/0x100d、0x110b、0x1310 位 4），全部一致；SPMI 通道从仲裁器映射表动态查，不依赖 SoC |
 | 触屏 | Goodix GT9896，GENI I2C 0xa84000 | **Novatek NT36672C，GENI SPI，QUP SE7 0x984000**，复位 GPIO4，中断 GPIO5，5 MHz | sweet 的 I2C 驱动保持关闭；**新驱动 0082**（见下文“触屏驱动”），默认开启，开机 30 s 后启动 |
-| USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 一个寄存器） | 补丁 0072 USB **默认关闭** |
+| USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 是 EUD 使能寄存器，不碰） | **补丁 0083**：GCC 时钟偏移按 gcc-lito.c 改（sleep 0x0f018、utmi 0x0f01c、cfg-noc-axi 0x0f07c、aggre-axi 0x0f080；GDSC 0x0f004、master 0x0f010、clkref 0x8c010 不变；lito 没有 ahb2phy 分支，去掉），PHY 诊断改读 SNPS 寄存器，`sweetusb` 默认恢复为 1（只读状态）。DWC3 0x0a600000、QSCRATCH 0x0a6f8800 相同，原厂设备树同样 `maximum-speed = "high-speed"`，设备模式代码（DCFG 速率强制高速）不用改 |
 | 固定保留区最高处 | ramdump_fb 0xaf000000 | disp_rdump_region 0xac000000-0xad000000 | 0xb0000000-0xfd000000 内无固定保留区（已用脚本核对） |
 
 ### 本分支已完成的改动（全部离线完成，未上机）
@@ -44,8 +44,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - `xnu/patches/`：0010、0012（帧缓冲地址）、0060（音量上 GPIO6；触屏默认关）、0062（电池 SID 2）、0072（USB 默认关）。
   只改行内常量，行数不变。
 - `shim/`（0082 配套）：`fdt_chosen_panel()` 读 ABL 选中的面板，loader 追加 `picassopanel=`；`fdt_host_test` 加了面板解析自测。
+- `tools/mkadt.py`：CPU clock-frequency 改为 picasso 实测最高频率（cpu7 2.40 GHz、cpu6 2.208 GHz、其余 1.8048 GHz；只是描述值）。
+- 其余 sweet 补丁里的物理地址已全部扫过：除触屏（sweet_touch.c，已停用）、RPMh（sweet_rpmh.c，只有 sweet_touch 调用）、
+  USB（0083 已改）外，keys/SPMI 地址与 picasso 相同，SMP 走 PSCI，显示电源（0079）是纯软件，没有别的 SoC 相关地址。
 - `tools/check-patch-series.py`：按 CI 规则在本机把补丁应用到干净的 xnu-8796.141.3。结果：本仓库 82 个补丁（含 0082）**全部应用**，
   另有 4 个构建脚本自带、针对其他 macOS 版本的补丁被跳过（原版 ios-sweet 跳过的也是这 4 个）。
+  加上 0083 后本仓库 83 个补丁同样全部应用（2026-10-22）。
   打完补丁的源码里 picasso 常量已确认生效。本机检出位置：`../.scratch/xnu-8796-pristine`、`../.scratch/dxb`（不入库）。
 
 ### 当前阻塞（按顺序）
@@ -96,7 +100,8 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   看屏幕：红底文字出现 = 帧缓冲地址正确；记下 "DRAM banks" 各段 base/size 和 "RMTFS base"，据此设置
   `tools/mkadt.py --highmem --high-base= --high-size=`，并确认 RMTFS 不在 0xb0000000-0xfd000000 内。
 - 用户提供 GitHub 账号后：fork、推送 `picasso` 分支、`gh workflow run xnu.yml`，下载 `xnu-kernel` 产物，
-  再 `tools/mkpayload.py`（命令行先用 `cpus=1`；触屏先加 `picassotouchlog=1`）+ `shim/build_macos.py PAYLOAD`。
+  再 `tools/mkpayload.py`（命令行先用 `cpus=1`；触屏先加 `picassotouchlog=1`；想看真实电量加 `sweetbattery=1`；
+  USB 默认只打印状态，要 USB 网络用 `sweetusb=2`）+ `shim/build_macos.py PAYLOAD`。
   打包前先跑 `tools/picasso-touch-fw.py`，否则 ADT 里没有触屏固件（mkadt 会警告）。
 - CI 编译 0082 如果报错，先看 `picasso_touch.c` 里 `PE_parse_boot_arg_str`、`delay`、`kernel_thread_start` 的声明
   （本地只用 SDK 头检查过）。

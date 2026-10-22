@@ -1,0 +1,81 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -4,7 +4,10 @@
+  * The phone's USB is a Synopsys DWC3 (USB 2.0 only, maximum-speed
+  * high-speed) at 0x0a600000 behind Qualcomm's dwc-usb3-msm wrapper, with a
+  * QUSB2 PHY at 0x088e2000; its power domain is the USB30_PRIM GDSC and its
+- * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c). ABL uses this
++ * clocks come from GCC (offsets from Linux gcc-sdmmagpie.c).
++ * picasso（SM7250）：同一个 DWC3（0x0a600000，原厂设备树同样 maximum-speed = "high-speed"），
++ * USB2 PHY 换成 SNPS femto（hsphy@88e3000，phy-msm-snps-hs.c）；GDSC 仍是 0x0f004，
++ * 时钟偏移按 gcc-lito.c 改（lito 没有单独的 ahb2phy 时钟分支）。ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -51,19 +54,20 @@ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
++	/* picasso：gcc-lito.c 的 halt_reg；下标 0 master、3 cfg-noc-axi 在下面用来判断能否读 DWC3 */
+ 	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
+-	{ "cfg-noc-axi", 0x0502c },
+-	{ "aggre-axi", 0x8201c },
+-	{ "ahb2phy", 0x6a004 },
++	{ "sleep", 0x0f018 },
++	{ "utmi", 0x0f01c },
++	{ "cfg-noc-axi", 0x0f07c },
++	{ "aggre-axi", 0x0f080 },
+ 	{ "clkref", 0x8c010 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+ #define DWC3_SIZE               0x0000d000
+-#define QUSB2_PA                0x088e2000
+-#define QUSB2_SIZE              0x00000400
++/* picasso：SNPS femto HS PHY（reg <0x88e3000 0x110>；0x88e2000 是 EUD 使能寄存器，不碰） */
++#define HSPHY_PA                0x088e3000
++#define HSPHY_SIZE              0x00000110
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -76,7 +80,7 @@ usb_rd(vm_offset_t base, uint32_t off)
+ void
+ sweet_usb_probe(void)
+ {
+-	int enabled = 0;	/* picasso：USB PHY 与时钟未适配，默认关闭 */
++	int enabled = 1;	/* picasso：时钟偏移与 PHY 已按 SM7250 改，恢复 sweet 的默认值（只读状态） */
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+@@ -119,19 +123,19 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	if (cbcr[5] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+-		return;
+-	}
+-	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	/* picasso：ABL 的 fastboot 刚用过这个 PHY，控制器有电有时钟时它的 AHB 也可读（只读诊断）。 */
++	vm_offset_t phy = ml_io_map(HSPHY_PA, HSPHY_SIZE);
+ 	if (phy == 0) {
+ 		return;
+ 	}
+-	/* DT qcom,qusb-phy-reg-offset order (Linux phy-msm-qusb-v2.c): PORT_TUNE1 0x240,
+-	 * PLL_COMMON_STATUS_ONE 0x1a0, PWR_CTRL1 0x210, INTR_CTRL 0x230,
+-	 * PLL_CORE_INPUT_OVERRIDE 0x0a8, TEST1 0x254. */
+-	printf("SWEET USB: QUSB2 PLL_STATUS 0x%08x PWR_CTRL1 0x%08x PORT_TUNE1 0x%08x TEST1 0x%08x\n",
+-	    usb_rd(phy, 0x1a0), usb_rd(phy, 0x210), usb_rd(phy, 0x240), usb_rd(phy, 0x254));
++	/* phy-msm-snps-hs.c：UTMI_CTRL0 0x3c、UTMI_CTRL5 0x50（POR 位 1）、HS_PHY_CTRL_COMMON0 0x54、
++	 * HS_PHY_CTRL2 0x64、CFG0 0x94、REFCLK_CTRL 0xa0、PARAMETER_OVERRIDE_X0..X3 0x6c..0x78 */
++	printf("SWEET USB: SNPS HSPHY UTMI0 0x%08x UTMI5 0x%08x COMMON0 0x%08x CTRL2 0x%08x CFG0 0x%08x REFCLK 0x%08x\n",
++	    usb_rd(phy, 0x3c), usb_rd(phy, 0x50), usb_rd(phy, 0x54), usb_rd(phy, 0x64),
++	    usb_rd(phy, 0x94), usb_rd(phy, 0xa0));
++	printf("SWEET USB: SNPS HSPHY OVERRIDE X0..X3 0x%02x 0x%02x 0x%02x 0x%02x\n",
++	    usb_rd(phy, 0x6c) & 0xffu, usb_rd(phy, 0x70) & 0xffu, usb_rd(phy, 0x74) & 0xffu,
++	    usb_rd(phy, 0x78) & 0xffu);
+ }
+ 
+ /*

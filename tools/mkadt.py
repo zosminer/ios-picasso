@@ -193,7 +193,8 @@ def build(seed=None, qemu=False, highmem=False, touch_fw_dir=TOUCH_FW_DIR):
             ('l3-cache-id', u32(0)),     # shared L3
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2304000000 if core >= 6 else 1804800000)),
+            # picasso：cpu7 2.40 GHz、cpu6 2.208 GHz、cpu0-5 1.8048 GHz（adb 读到的 cpufreq 最高频率；只是描述值）
+            ('clock-frequency', u32({7: 2400000000, 6: 2208000000}.get(core, 1804800000))),
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
