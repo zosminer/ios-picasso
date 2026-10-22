@@ -83,7 +83,7 @@
 +void
 +sweet_usb_probe(void)
 +{
-+	int enabled = 1;
++	int enabled = 0;	/* picasso：USB PHY 与时钟未适配，默认关闭 */
 +	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
 +	bool clocks_on = true;
 +

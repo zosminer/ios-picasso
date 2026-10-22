@@ -13,7 +13,7 @@
 #include "console.h"
 #include "ufs.h"
 
-#define UFS_BASE	0x01d84000UL	/* ufshc@1d84000, sweet live FDT */
+#define UFS_BASE	0x01d84000UL	/* picasso：lito.dtsi ufshc@1d84000（ufs_mem），与 sweet 相同 */
 
 #define REG_CAP		0x00
 #define REG_VER		0x08

@@ -11,13 +11,14 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "fdt.h"
 
-#define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146ab65cUL	/* picasso：qcom,msm-imem@146ab000 的 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0c264000UL
+#define PSHOLD			0x0c264000UL	/* picasso：restart@c264000（qcom,pshold），与 sweet 相同 */
 
-#define GICD_BASE		0x17a00000UL
-#define GICR_BASE		0x17a60000UL
+#define GICD_BASE		0x17a00000UL	/* picasso：lito.dtsi GICD，与 sweet 相同 */
+#define GICR_BASE		0x17a60000UL	/* picasso：lito.dtsi GICR（8 × 0x20000），与 sweet 相同 */
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -377,11 +378,37 @@ void shim_main(uint64_t dtb)
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
 	con_clear(RED);
-	con_str("SHIM", "sweet milestone 4: xnu loader");
+	con_str("SHIM", "picasso K30 5G: xnu loader");
 	con_skip();
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
+
+	/*
+	 * picasso 新增：把 ABL 填好的真实 DRAM 分布打到屏幕上。没有 root 读不到这张表，
+	 * 而 tools/mkadt.py 的高位内存（--highmem）必须按它来设置。请拍照记录这几行。
+	 */
+	{
+		uint64_t mb[8], ms[8];
+		int n = fdt_memory_banks(dtb, mb, ms, 8);
+		con_hex("DRAM banks", (uint64_t)n);
+		for (int i = 0; i < n; i++) {
+			con_hex(" base", mb[i]);
+			con_hex(" size", ms[i]);
+		}
+		/*
+		 * rmtfs（基带远程文件系统共享内存）的地址由 ABL 运行时填入。它必须在
+		 * tools/mkadt.py 的内核内存窗口之外，sweet 就是为它把窗口截止在 0xfd000000。
+		 */
+		uint64_t rb = 0, rs = 0;
+		if (fdt_node_reg(dtb, "qcom,rmtfs_sharedmem", &rb, &rs)) {
+			con_hex("RMTFS base", rb);
+			con_hex("RMTFS size", rs);
+		} else {
+			con_str("RMTFS", "not found");
+		}
+		con_skip();
+	}
 
 	/* No payload: probe the internal UFS while the MMU is still off. */
 	stage = "ufs";
@@ -405,7 +432,7 @@ void shim_main(uint64_t dtb)
 	if (rc)
 		con_clear(RED);
 
-	con_str("SHIM", "sweet milestone 3");
+	con_str("SHIM", "picasso K30 5G: diagnostics");
 	con_skip();
 	con_hex2("DTB", "at=", dtb, "magic=", dtb ? __builtin_bswap32(rd32(dtb)) : 0);
 	con_hex2("IMAGE", "lo=", mi.img_lo, "hi=", mi.img_hi);

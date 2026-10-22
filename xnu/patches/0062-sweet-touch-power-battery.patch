@@ -561,7 +561,7 @@
 +{
 +	/* Restrict access to the battery blocks; keys retain their own lanes. */
 +	unsigned peripheral = addr >> 8;
-+	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	if (!sp_ready || !out || sid != 2 || addr > 0xffffu ||
 +	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
 +	    peripheral != 0x13 && peripheral != 0x48)) {
 +		return -1;
@@ -773,7 +773,7 @@
 +	int mode = measured ? 1 : 0;
 +	if (mode != fLastMode) {
 +		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
-+		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? "PM7250B / estimated SOC" : "static fallback",
 +		    percent, mv, external, charging);
 +		fLastMode = mode;
 +	}
@@ -788,8 +788,8 @@
 +	uint16_t previous = 0;
 +	for (unsigned attempt = 0; attempt < 4; ++attempt) {
 +		uint8_t lo, hi;
-+		if (sweet_spmi_read(0, address, &lo) ||
-+		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(2, address, &lo) ||
++		    sweet_spmi_read(2, address + 1, &hi)) {
 +			return false;
 +		}
 +		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
@@ -828,14 +828,14 @@
 +	uint8_t type, present, usb, path, charger, error, temperature;
 +	uint16_t rawVoltage;
 +	bool valid = fReal &&
-+	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
-+	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    !sweet_spmi_read(2, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(2, 0x4808, &present) && (present & 1u) &&
 +	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
-+	    !sweet_spmi_read(0, 0x1310, &usb) &&
-+	    !sweet_spmi_read(0, 0x110b, &path) &&
-+	    !sweet_spmi_read(0, 0x1006, &charger) &&
-+	    !sweet_spmi_read(0, 0x1007, &error) &&
-+	    !sweet_spmi_read(0, 0x100d, &temperature);
++	    !sweet_spmi_read(2, 0x1310, &usb) &&
++	    !sweet_spmi_read(2, 0x110b, &path) &&
++	    !sweet_spmi_read(2, 0x1006, &charger) &&
++	    !sweet_spmi_read(2, 0x1007, &error) &&
++	    !sweet_spmi_read(2, 0x100d, &temperature);
 +	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
 +	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
 +	valid = valid && mv >= 2800 && mv <= 4600;
@@ -853,7 +853,7 @@
 +	int ma = 0;
 +	uint8_t subtype;
 +	uint16_t rawCurrent;
-+	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
++	bool currentValid = !sweet_spmi_read(2, 0x4805, &subtype) &&
 +	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
 +	    rawCurrent != 0x8000;
 +	if (currentValid) {

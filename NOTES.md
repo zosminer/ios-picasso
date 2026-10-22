@@ -1,5 +1,71 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## picasso（红米 K30 5G，SM7250）移植：交接记录（2026-10-22，最先阅读）
+
+本分支 `picasso` 基于 ios-sweet 425b251，目标是在红米 K30 5G（picasso，骁龙 765G / SM7250，8 GB 内存，
+MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 iOS 16.7.16（20H392）用户空间。
+用户看不懂英文：与用户沟通、给用户看的说明都用中文。下面区分“已验证”和“推测/待上机确认”。
+
+### 手机状态（2026-10-22）
+- Bootloader **仍锁定**，用户已申请解锁，要等 168 小时。至今 **从未在这台手机上启动过任何移植镜像**。
+- USB 调试已开、Mac 已授权（adb 序列号见 `设备信息.md`，不入库）。未 root，`/sys`、`/proc/iomem`、`/vendor/firmware` 大多读不到。
+- 工作区 `../../firmware/V13.0.3.0.SGICNXM/`（不在本仓库）：从官方卡刷包下载的 xbl/abl/boot/dtbo 等，
+  `dtb/1.dtb`（Lito v2 基础设备树）、`dtbo/20.dtbo`（"7250 picasso"，board-id 36）、合成的 `picasso-merged.dts`。
+
+### picasso 与 sweet 的硬件对照（全部来自 picasso 原厂设备树，已核对）
+| 项目 | sweet（SM7150） | picasso（SM7250） | 处理 |
+|---|---|---|---|
+| 开机画面帧缓冲 | 0x9c000000 | **0xa0000000**（cont_splash_region，0x2300000） | 已改 shim、mkadt、补丁 0010/0012 |
+| 屏幕 | 1080x2400 | 1080x2400，LCD DSC 视频模式（G7A 面板） | 不变 |
+| IMEM 重启原因 | 0x146aa65c | **0x146ab65c**（msm-imem@146ab000 + 0x65c） | 已改 shim |
+| PSHOLD / GICD / GICR / UFS | 0x0c264000 / 0x17a00000 / 0x17a60000 / 0x1d84000 | 相同 | 只加了注释 |
+| 定时器 | 19.2 MHz，虚拟定时器 PPI 3 → INTID 19 | 相同 | 不变 |
+| CPU | 6×A55 + 2×A76，MPIDR 0x000-0x700 | 相同拓扑（Kryo 475） | ADT 附加 qcom,kryo475，**保留 qcom,kryo470**（补丁 0018/0038 按它匹配） |
+| SPMI 仲裁器 | v5，core 0xc440000，obsrvr 0xe600000，cnfg 0xc40a000 | 相同 | 不变 |
+| 电源键 / 音量下 | PM6150 PON 0x800（SID 0） | PM8150 PON 0x800（SID 0），位 0 / 位 1 | 不变 |
+| 音量上 | PM6150L GPIO2，PPID 0x4c1，寄存器 0xc1xx | **PM8150L GPIO6，PPID 0x4c5，寄存器 0xc5xx** | 已改补丁 0060 |
+| 电量计 / 充电器 | PM6150（SID 0） | **PM7250B（SID 2）**：QGauge 0x4800，SMB5 0x1000-0x13ff | 已改补丁 0062（默认仍是固定 100%，sweetbattery=1 才读） |
+| 触屏 | Goodix GT9896，GENI I2C 0xa84000 | **Novatek NT36672C，GENI SPI，QUP SE7 0x984000**，复位 GPIO4，中断 GPIO5，5 MHz | 补丁 0060 触屏 **默认关闭**；驱动未写 |
+| USB2 PHY | QUSB2 0x88e2000 | **SNPS femto 0x88e3000**（另有 0x88e2000 一个寄存器） | 补丁 0072 USB **默认关闭** |
+| 固定保留区最高处 | ramdump_fb 0xaf000000 | disp_rdump_region 0xac000000-0xad000000 | 0xb0000000-0xfd000000 内无固定保留区（已用脚本核对） |
+
+### 本分支已完成的改动（全部离线完成，未上机）
+- `shim/`：上面的地址；新增 `fdt_memory_banks()`、`fdt_node_reg()`，启动时在屏幕上打印 ABL 填入的
+  **DRAM 区段**和 **RMTFS 地址**（没有 root 读不到，必须上机拍照记录）；屏幕标题改为 "picasso K30 5G"。
+- `shim/build_macos.py`：在 Mac 上用 Homebrew LLVM 构建 shim 并打包 boot.img（原 build.sh 只能在 Linux 用）。
+  clang 需要 `-fno-jump-tables`（否则 shim.c 出现 4 个 ABS64 绝对重定位）和 `shim/libc.c`（strcmp）。
+  镜像头参数与原厂 boot.img **逐项一致**（v2、base 0、内核 0x8000、ramdisk 0x1000000、tags 0x100、DTB 0x1f00000、
+  os_version 11.0.0、补丁级别 2022-10），DTB 用原厂 boot.img 的整段 DTB。补丁级别故意不用 sweet 的 2035-06：
+  更高的补丁级别可能让 TrustZone 的 keymaster 升级记录，回到 MIUI 后出问题（推测，未验证）。
+- `shim/fdt_host_test.c`：在电脑上测试设备树解析；用原厂 DTB 和模拟 ABL 填写后的 DTB 均通过，错误期望值能被发现。
+- `tools/mkadt.py`：帧缓冲 0xa0000000/0x2300000，合成 ECID 'PICASSO'+1，根 compatible 追加 xiaomi,picasso / qcom,lito
+  （保留 xiaomi,sweet 供 SweetPlatformExpert 匹配），新增 `--high-base=`/`--high-size=` 覆盖高位内存段。
+  低位与高位两种 ADT 都能生成，关键值已核对。
+- `xnu/patches/`：0010、0012（帧缓冲地址）、0060（音量上 GPIO6；触屏默认关）、0062（电池 SID 2）、0072（USB 默认关）。
+  只改行内常量，行数不变。
+- `tools/check-patch-series.py`：按 CI 规则在本机把补丁应用到干净的 xnu-8796.141.3。结果：本仓库 81 个补丁 **全部应用**，
+  另有 4 个构建脚本自带、针对其他 macOS 版本的补丁被跳过（原版 ios-sweet 跳过的也是这 4 个）。
+  打完补丁的源码里 picasso 常量已确认生效。本机检出位置：`../.scratch/xnu-8796-pristine`、`../.scratch/dxb`（不入库）。
+
+### 当前阻塞（按顺序）
+1. **内核要在 GitHub Actions（macos-14，Xcode 15）上编译**：需要用户的 GitHub 账号 fork 本仓库并运行 `xnu.yml`。
+   本机未装 gh，也未推送过任何东西。本机 Xcode 26.3 的 iig 与 xnu-8796 不兼容（见 workflow 注释），不能本地编整个内核。
+2. **iOS 根文件系统镜像**：要下载 iPhone X 16.7.16（20H392）IPSW（约 6 GB），再在 Linux 上用 apfs-fuse + hfsprogs 制作
+   （`tools/mkiosroot.sh`）。用户说下载晚点再看。注意这台 Mac 的 `/etc/hosts` 屏蔽了 updates.cdn-apple.com（用户用来挡 macOS 更新），
+   不要改 hosts；可用工作区 `../../tools/apple-cdn-dns` 只在构建进程内绕过。Docker 已安装但守护进程没开。
+3. **Bootloader 解锁**（约 7 天后）。
+4. 触屏驱动：Novatek NT36672C 是 SPI 接口、通常需要主机每次开机下载触屏固件（`novatek_nt36672c_g7a_fw0X.bin`，
+   在 /vendor/firmware，非 root 读不到；可从官方卡刷包的 vendor 镜像提取）。这是推测，要读 picasso 内核
+   `drivers/input/touchscreen/nt36xxx/` 确认。需要新写 GENI SPI 传输和 Novatek 协议。
+
+### 下一步（具体动作）
+- 解锁后第一步：`python3 shim/build_macos.py`，`fastboot boot shim/out/shim-boot.img`（只进内存，不写分区）。
+  看屏幕：红底文字出现 = 帧缓冲地址正确；记下 "DRAM banks" 各段 base/size 和 "RMTFS base"，据此设置
+  `tools/mkadt.py --highmem --high-base= --high-size=`，并确认 RMTFS 不在 0xb0000000-0xfd000000 内。
+- 用户提供 GitHub 账号后：fork、推送 `picasso` 分支、`gh workflow run xnu.yml`，下载 `xnu-kernel` 产物，
+  再 `tools/mkpayload.py`（命令行先用 `cpus=1 sweettouch=0`）+ `shim/build_macos.py PAYLOAD`。
+- 写入 userdata（会清空 MIUI 数据）前必须再次征得用户同意，并先备份 persist、modemst1/2、fsg、fsc。
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

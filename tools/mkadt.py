@@ -10,6 +10,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
 # Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
+# picasso：原厂设备树（boot.img 的 Lito v2 + dtbo 的 7250 picasso）里位置固定的保留区，最高的是
+# disp_rdump_region 0xac000000-0xad000000，0xb0000000 以上没有任何固定保留区；所以沿用 sweet 的
+# 低位窗口 0xb0000000-0xfd000000（1.2 GiB）。前提是 0x80000000 起的第一段 DRAM 有 2 GiB，
+# 需用诊断 shim 打在屏幕上的 "DRAM banks" 核对。
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
 # Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
@@ -21,6 +25,9 @@ PANIC_LOG_SIZE = 0x100000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
+# picasso：真实的高位内存段还不知道（没有 root 读不到），先沿用 sweet 的保守值；
+# 8 GB 的 K30 5G 高位段应不小于它。拿到诊断 shim 显示的 DRAM banks 后，用
+# --high-base=0x... --high-size=0x... 覆盖，不必改代码。
 HIGH_PHYS_BASE = 0x100000000
 HIGH_MEM_SIZE = 0xfcc00000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
@@ -28,8 +35,9 @@ SOC_BASE = 0x01000000
 
 GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
-FB, FB_SIZE = 0x9c000000, 0x1700000
-SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+# picasso：cont_splash_region <0xa0000000 0x2300000>
+FB, FB_SIZE = 0xa0000000, 0x2300000
+SWEET_ECID = 0x5049434153534f01  # picasso：'PICASSO' + 1，合成值，不是真实芯片 ID
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
@@ -39,7 +47,7 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'picasso boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -138,7 +146,7 @@ def build(seed=None, qemu=False, highmem=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
+            ('compatible', cstr('qcom,kryo470') + cstr('qcom,kryo475') + cstr('ARM,v8')),  # picasso：内核 CPU 驱动（补丁 0018/0038）按 qcom,kryo470 匹配，必须保留；kryo475 只是附加描述
             ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
@@ -231,7 +239,7 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('xiaomi,picasso') + cstr('qcom,lito') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -242,6 +250,12 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
+    # picasso：--high-base=0x... / --high-size=0x... 覆盖高位内存段（按诊断 shim 的 DRAM banks 填写）
+    for arg in sys.argv:
+        if arg.startswith('--high-base='):
+            HIGH_PHYS_BASE = int(arg.split('=', 1)[1], 0)
+        elif arg.startswith('--high-size='):
+            HIGH_MEM_SIZE = int(arg.split('=', 1)[1], 0)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
