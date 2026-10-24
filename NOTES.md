@@ -173,8 +173,19 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   路径按 Procursus rootless /var/jb（我们的越狱环境未定，上机前按实际改路径）。
 - 验证：check-patch-series 本仓库 95 个补丁全部应用、与草稿树逐字节一致；sweet_usb.c 无新增 C 错误；clean-base `sh -n` 通过；
   validate-repo 通过。IOKit 的 .cpp 无法用 SDK 头单独语法检查（要 XNU 源码树），靠补丁能干净套用 + 与 sapphire 原补丁基本一致来保证。**仍未上机。**
-- 还剩（更大/更靠后）：sapphire 0164（IOSurface 可换出，防越用越卡；依赖我们没有的 scanoutPhys，要手工改）；
-  GPU 照 HackiOS redwood_adreno.c（APSL 2.0，同类 a6xx+GMU，寄存器地址与我们原厂设备树一致）移植到 0091 之上。
+- **0096 IOSurface 内存可换出、可清空**（sapphire 0164，2026-10-24 补）：sapphire 实测缓冲表面几分钟动画后从 416 MB 涨到
+  1.3 GB、全部常驻，手机越用越卡；CoreAnimation/SpringBoard 会把能重画的表面设成易失，指望 VM 收回，以前只记了状态。
+  - `SweetSurface.cpp`：缓冲表面改用 `kIOMemoryPageable | kIOMemoryPurgeable`；SetPurgeable 真的调 `setPurgeable()`
+    （IOSurface 0/1/2/3 → IOKit 非易失/易失/清空/只问），VM 拿走了页面就回报"清空"让客户端重画；上限 1.5 GB → 3 GB。
+  - **和 sapphire 不同的地方**：sapphire 的内核读像素靠它的 GPU 显示窗口 prepare()；我们没 GPU，内核读像素的是
+    `AppleCLCD::present` 的 CPU 拷贝。读一个已被 VM 清空的易失表面会内核缺页 panic，所以加了
+    `sweet_surface_pin/unpin`：读之前把易失表面临时设成非易失，已经被清空就跳过这一层；读完恢复客户端要的状态；
+    钉住期间客户端的 SetPurgeable 只记下、unpin 时再生效。非易失表面（屏幕上显示的，最常见）pin 不碰 VM，没有额外开销。
+    sapphire 没有 scanoutPhys 以外的分支，我们没有 scanoutPhys，相应条件去掉；面板内存和包装的客户端内存不受影响。
+  - present 在 vsync 工作循环线程里、fLock 已放开，可以缺页；sweet_surface_lock 是 IOLock（互斥锁），持有时缺页也安全。
+  - 验证：96 个补丁全部应用、与草稿树一致；SweetSurface/SweetFramebuffer/SweetKeyStore/SweetAMFIService 用 SDK 头 +
+    存根 board_config.h 语法检查，只剩 SDK 缺的私有 API（copyPortNameForObjectInTask/copyObjectForPortNameInTask）两条已知假错误。**未上机。**
+- 还剩：GPU 照 HackiOS redwood_adreno.c（APSL 2.0，同类 a6xx+GMU，寄存器地址与我们原厂设备树一致）移植到 0091 之上（用户说先不管）。
 
 ### GitHub 新进展核对（2026-10-24）
 本地副本：`../.scratch/github-refs/`（minhtritt-omp = minhtritt 的 omp 分支工作树，hackios/、ios-topaz/、yincql-unixnu-picasso/）。

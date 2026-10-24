@@ -1,0 +1,166 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -534,12 +534,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		/* picasso 0096：表面内存可换出、可被清空了；读之前钉住（非易失），已被清空就跳过这一层 */
++		if (src != 0 && bpe == 4 && sweet_surface_pin(s)) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
++			sweet_surface_unpin(s);
+ 		}
+ 		s->release();
+ 	}
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -93,10 +93,65 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+-#define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++/* picasso 0096（sapphire 0164）：缓冲表面现在可换出，不再全部常驻内存，上限从 1.5 GB 放到 3 GB；
++ * 真正的内存压力交给 VM（压缩、清空易失表面、jetsam）。 */
++#define SWEET_SURFACE_WIRED_MAX         (3072ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++/* picasso 0096：IOSurface 的可清空状态（0 非易失、1 易失、2 清空、3 只问）对应的 IOKit 状态 */
++static const IOOptionBits sweet_purgeable_to_io[4] = {
++	kIOMemoryPurgeableNonVolatile, kIOMemoryPurgeableVolatile,
++	kIOMemoryPurgeableEmpty, kIOMemoryPurgeableKeepCurrent,
++};
++
++/* 表面自己的可换出缓冲；面板内存（物理）和包装的客户端内存返回 NULL。 */
++static IOBufferMemoryDescriptor *
++sweet_surface_purgeable_buffer(SweetSurface *s)
++{
++	return s->wrapped ? NULL : OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++}
++
++bool
++sweet_surface_pin(SweetSurface *s)
++{
++	bool ok = true;
++
++	IOLockLock(sweet_surface_lock);
++	IOBufferMemoryDescriptor *buf = sweet_surface_purgeable_buffer(s);
++	/* 非易失的（最常见：屏幕上正在显示的）什么都不用做，不碰 VM */
++	if (buf != NULL && s->pins == 0 && s->purgeable != 0) {
++		IOOptionBits old = 0;
++		if (buf->setPurgeable(kIOMemoryPurgeableNonVolatile, &old) != kIOReturnSuccess) {
++			ok = false;
++		} else if (old == kIOMemoryPurgeableEmpty) {
++			/* 已被 VM 清空：内容没了，恢复"清空"让客户端知道要重画，这一帧不读它 */
++			(void)buf->setPurgeable(kIOMemoryPurgeableEmpty, NULL);
++			ok = false;
++		}
++	}
++	if (ok) {
++		s->pins++;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return ok;
++}
++
++void
++sweet_surface_unpin(SweetSurface *s)
++{
++	IOLockLock(sweet_surface_lock);
++	IOBufferMemoryDescriptor *buf = sweet_surface_purgeable_buffer(s);
++	if (s->pins > 0 && --s->pins == 0 && buf != NULL && s->purgeable != 0 && s->purgeable < 3) {
++		/* 恢复客户端要的状态（钉住期间它可能又改过） */
++		(void)buf->setPurgeable(sweet_purgeable_to_io[s->purgeable], NULL);
++		if (s->purgeable == 2) {
++			s->purgeable = 1;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -762,8 +817,15 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++			/*
++			 * picasso 0096（sapphire 0164）：可换出、可清空，和真 iPhone 上 IOSurface 的内存一样。
++			 * CoreAnimation 和 SpringBoard 会把能重画的表面（app 快照、图片缓存）设成易失，指望内存紧张时
++			 * VM 收回；以前全部常驻，几分钟动画后表面涨到 1.3 GB、手机越用越卡（sapphire 实测）。
++			 * 内核要读像素的地方（AppleCLCD::present）先 sweet_surface_pin()。
++			 */
+ 			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPageable | kIOMemoryPurgeable,
++			    s->allocSize, page_size);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+@@ -1155,12 +1217,26 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		}
+ 		IOLockLock(sweet_surface_lock);
+ 		if (selector == kSweetSurfaceSetPurgeable) {
++			/*
++			 * picasso 0096（sapphire 0164）：IOSurface 的状态（0 非易失、1 易失、2 清空、3 只问）对应到 VM 的。
++			 * 自己的可换出缓冲才真的设成易失；VM 拿走了页面就报"清空"，客户端会重画。
++			 * 内核正在读（pins > 0）时不动 VM 状态，只记下请求，unpin 时再生效。
++			 */
++			uint32_t asked = (uint32_t)args->scalarInput[1], old = s->purgeable;
++			IOBufferMemoryDescriptor *buf = sweet_surface_purgeable_buffer(s);
++			if (buf != NULL && s->pins == 0 && asked <= 3) {
++				IOOptionBits io_old = 0;
++				if (buf->setPurgeable(sweet_purgeable_to_io[asked], &io_old) == kIOReturnSuccess) {
++					old = io_old == kIOMemoryPurgeableVolatile ? 1 : io_old == kIOMemoryPurgeableEmpty ? 2 : 0;
++				}
++			}
+ 			if (args->scalarOutputCount >= 1) {
+-				args->scalarOutput[0] = s->purgeable;
++				args->scalarOutput[0] = old;
+ 				args->scalarOutputCount = 1;
+ 			}
+-			if (args->scalarInput[1] != 3) {        /* 3: only ask */
+-				s->purgeable = (uint32_t)args->scalarInput[1];
++			if (asked < 3) {                        /* 3: only ask */
++				/* 已经清空的缓冲之后就是"易失"（VM 会报清空）；钉住期间的清空请求留到 unpin 再做 */
++				s->purgeable = (asked == 2 && (buf == NULL || s->pins == 0)) ? 1 : asked;
+ 			}
+ 		} else if (selector == kSweetSurfaceBindAccel && args->scalarInputCount >= 3) {
+ 			uint16_t accel[2] = { (uint16_t)args->scalarInput[1], (uint16_t)args->scalarInput[2] };
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -40,11 +40,12 @@ public:
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+ 	OSDictionary             *values;       /* IOSurfaceSetValue & co. */
+-	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
++	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state: 0 non-volatile, 1 volatile, 2 empty (asked while pinned) */
++	uint32_t                  pins;         /* picasso 0096：内核正在读它的像素（sweet_surface_pin），期间保持非易失 */
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (IOSurfaceWrapClient*) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; pins = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use), or 0. */
+@@ -54,6 +55,14 @@ public:
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
++/*
++ * picasso 0096：缓冲表面的内存可换出、可被清空（sapphire 0164）。内核读它的像素之前要钉住：
++ * 设成非易失，VM 已经清空了就返回 false（这一帧别读它）；读完 unpin 恢复客户端要的状态。
++ * 面板内存和包装的客户端内存不受影响（pin 总是成功）。线程上下文，不能在自旋锁下调用。
++ */
++bool sweet_surface_pin(SweetSurface *s);
++void sweet_surface_unpin(SweetSurface *s);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
