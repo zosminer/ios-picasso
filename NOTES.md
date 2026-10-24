@@ -30,6 +30,8 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 | 固定保留区最高处 | ramdump_fb 0xaf000000 | disp_rdump_region 0xac000000-0xad000000 | 0xb0000000-0xfd000000 内无固定保留区（已用脚本核对） |
 
 ### 本分支已完成的改动（全部离线完成，未上机）
+- 2026-10-22 夜：补丁 0088（topaz 显示加速件）、0089（亮度滑块）、0090（USB PHY/UTMI/分步启动）、
+  0091（Adreno 620 时钟与 CX 域准备）、`tools/picasso-gpu-fw.py`，见下面“补丁 0088-0091”。
 - 2026-10-22 晚：shim 在 x0 不是设备树时找负载（`hunt_payload`，带主机自测）、
   屏幕打印 `ABL x0`；`mkadt.py --highmem` 默认 0x1_40000000 + 3 GiB；0083 加回 ahb2phy；本节上面两段真机结论。
 - `shim/`：上面的地址；新增 `fdt_memory_banks()`、`fdt_node_reg()`，启动时在屏幕上打印 ABL 填入的
@@ -78,13 +80,108 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `sweetusbnet=0` 不发布；同时移植 ios-topaz 0128（IOKit 永远不空闲，configd 的 InterfaceNamer 一直等）。
   `tools/sweet-root-tweaks.py` 新增 `network()`：写 preferences.plist 的 "USB Ethernet" 服务
   （ue0 手动 192.168.7.2/24、网关 192.168.7.1、DNS 1.1.1.1/8.8.8.8），已有文件时不动。
-  电脑侧要开 NAT（`tools/sweet-usbnet.sh` 只配地址）。**前提是 USB 设备模式能工作**，SM7250 上还缺 SNPS PHY 初始化。
+  电脑侧要开 NAT（`tools/sweet-usbnet.sh` 只配地址）。**前提是 USB 设备模式能工作**（PHY/UTMI/分步见下面 0090）。
 - **0087 熄屏省电**：`bsd/dev/picasso_cpufreq.c`，qcom,cpufreq-hw 三个频率域（0x18323000 / 0x18325800 / 0x18327800，
   std 偏移：ENABLE 0x0、LUT 0x110、PERF_STATE 0x920）。开机打印频率表和 ABL 设的档位；熄屏降到最低档，
   亮屏回到开机档位（`picassocpufreq=2` 亮屏用最高非加速档，`=0` 只打印）。电压和过热限频由硬件管。
   没有做真正的系统休眠（要 RPMh 睡眠集、AOSS 等，工作量很大）。
 - 已验证：87 个补丁全部能打上；新 C 文件都用 SDK 内核头做了语法检查（-Wall -Wextra -Wpedantic 无警告），
   C++ 文件（SweetBattery/SweetUSBNet）也做了语法检查；两个算法测试程序通过。**都没做过真正的内核编译，也没上机。**
+
+### 补丁 0088-0091（2026-10-22 夜，离线完成，未上机）
+- **0088 显示加速件（来自 ios-topaz 0131-0139，手工合并）**：SweetSurface 完善（客户端包装、IOSurfaceAddress、
+  值、trap 4 detach、僵尸页保留等）+ 空的 IOAcceleratorES 服务（省掉 QuartzCore 每个进程 30 秒的等待；
+  `sweetaccel=0` 不发布）。topaz 的直接 MDP 扫描（0092/0093）是 SM6225 专用，没搬。topaz 没写许可证，
+  这里只按它的做法重写/合并，出处写在补丁注释里；ios-sweet 本身是 MIT。
+- **0089 亮度滑块**：照 topaz 0105 发布 AppleARMBacklight，`AppleCLCD::setProperties` 的 IOMFBBrightnessLevel
+  → `picasso_backlight_set()`（0084 的 WLED5，最大 420 nit = 0xfff）。topaz 0110 发现 CPU 渲染时
+  数字调光太慢，所以默认关，`sweetbl=1` 打开。
+- **0090 USB HS PHY + 分步启动**（`bsd/dev/picasso_usbphy.c`，只在 `sweetusb=2` 时运行）：
+  - 重新解读了另一台 K30 5G 的日志（minhtritt Run 19/20）：PHY 寄存器是 8 位的，经 ahb2phy 桥读出来**每个字节重复四次**，
+    0x01010101/0x06060606/0x88888888 是真实值 0x01/0x06/0x88，不是总线假值；写入生效（Run 19 写 COMMON0 读回 0xb0b0b0b0）；
+    ahb2phy CBCR 0x80000002 是“硬件控制”，访问时自动开。ABL 之后 PHY 已是初始化好的样子（SLEEPM=1、POR=0、SUSPEND_N=1）。
+    **所以对方 ep0 超时的原因不是 PHY**，而是没把 PIPE 时钟切到 UTMI：不切时 Run 6/18/19/20 全超时，切了（Run 7）就不超时。
+  - 但切了的几次（Run 7/11/17）都在 2-3 秒后整机重启。那几次也正是控制器真正跑起来（TRB 交给控制器、RUN_STOP）的几次，
+    **分不清是写 GENERAL_CFG 本身还是之后的 DMA/中断**（对方认定是前者，证据不足）。UEFI 的 UsbConfigDxe 给 USB
+    建过一个 “HAL IOMMU usb domain”，退出时是否拆掉不知道——如果 SID 0xe0 还指向 UEFI 的页表，DMA 会出事。
+  - 做法：`picasso_usbphy_prepare()` 在控制器软复位前：apps SMMU 里 SID 0xe0 的 SMR/S2CR/CB 报告（只读，`sweetusbsmmu=0` 关）；
+    PM8150 L5A/L12A/L2A 三路电源的 SPMI 只读状态（`sweetusbvreg=1` 读到没电才 RPMh 投票，`=2` 都投，默认 0 只报告）；
+    开 ahb2phy 使能位，EUD 打开就不碰 PHY；PHY 不是 Linux 初始化后的样子才做 BCR 复位 + 完整 `msm_hsphy_init`
+    （带读回核对，`sweetusbphy=0` 只报告、`=2` 总是重来）。软复位后 `picasso_usb_utmi_select()` 按 dwc3-msm 顺序
+    DIS → SEL|PHYSTATUS_SW → 清 DIS（`sweetusbutmi=0` 不动、`=1` 默认没选才切、`=2` 总是切）；清 GUSB2PHYCFG 的
+    SUSPHY/ENBLSLPM，设 GCTL DSBLCLKGTNG（设备树 snps,disable-clk-gating）；不再设 LANE0_PWR_PRESENT（高速口，与 dwc3-msm 一致）。
+  - **分步**：`sweetusbstage=N` 在第 N 步后停：1 PHY/电源/SMMU，2 软复位+UTMI，3 ep0 配置，4 SETUP TRB 交给控制器（第一次 DMA），
+    5 RUN_STOP（不起事件线程）。`sweetusbslow=毫秒` 每步后等。事件线程每秒查 GSTS 位 7（DMA 总线错误）并打印 GBUSERRADDR。
+    端点命令超时会打印 DEPCMD/GUSB2PHYCFG/DSTS/GSTS/GENERAL_CFG。
+  - sweet_rpmh.c：cmd-db 改用原厂设备树的 reserved-memory 0x80860000（0x20000），不再读 0x0c3f000c 定位字；
+    白名单改为只放行 ldoa5 880 mV、ldoa12 1712-1800 mV、ldoa2 3050-3300 mV（sweet 的 ldoc11 在 picasso 上是另一路电，已拿掉）。
+    sweet_spmi.c：SID 0 的 0x41/0x44/0x4b 只读放行。
+- **0091 Adreno 620 准备**（`bsd/dev/picasso_gpu.c`，`picassogpu=N`，默认 0 = 不碰）：
+  - **A620 和 sapphire 的 A610 不一样**：有 GMU（qcom,gmu@3d6a000，固件 a650_gmu.bin），GX 域（核心、PLL0、gfx3d 时钟、
+    gfx.lvl 电压轨）由 GMU 固件经它自己的 RSC/PDC 向 RPMh 申请，gpucc-lito 里主机根本没有 GX 核心时钟。
+    sapphire 的“主机直接开 GX、读 RBBM”在这里走不通，要先把 GMU 启动起来（Linux a6xx_gmu.c 的流程）。
+  - `picassogpu=1`：只读 GCC/GPU CC 时钟树（从不碰 0x3d00000-0x3d8ffff）。`=2`：开 CX 域和 GMU 时钟（GPLL0/GPLL0_DIV 投票、
+    ddrss_gpu_axi/memnoc_gfx/snoc_dvm_gfx、CX GDSC、cxo/ahb、GMU 时钟 200 MHz、cx_gmu、SMMU 投票），把 CM3 按在复位
+    （CM3_SYSRESET=1），读 GMU 的 CX/AO 寄存器和常开计数器（10 ms 应涨约 192000），最后把改过的寄存器全部写回原值
+    （`picassogpukeep=1` 保持上电）。`picassogpudelay=秒`、`picassogpuslow=毫秒` 同 sapphire 的 gpu_delay/gpu_slow。
+  - 固件：`tools/picasso-gpu-fw.py ../../firmware/vendor-extract/vendor.img` 取出 a650_sqe.fw（31632）、a650_gmu.bin（41548）、
+    a620_zap.mdt/.b00-.b02 到 `research/picasso-gpu-fw/`（不入库）。zap 区域 = 设备树 pil_gpu_region@8bc15400（0x2000）。
+  - **后面的路（未写）**：GMU 用 kgsl-smmu（0x3da0000，gmu_user SID 4 / gmu_kernel SID 5，掩码 0x400）的 IOVA，要先做 SMMU 上下文；
+    按 a6xx_gmu.c 配 RSCC（0x3de0000）和 GMU PDC（0xb290000/0xb490000）、从 cmd-db 的 gfx.lvl/cx.lvl/mx.lvl 辅助数据建 ARC 投票表、
+    装 a650_gmu.bin 到 ITCM、HFI 队列、放开 CM3、HFI_START、OOB 开 GX；然后才是 zap（PAS）、SQE、环形缓冲区，
+    最后是 Mesa freedreno（turnip/freedreno 已支持 A620）接到 CoreAnimation，路子同 sapphire。工作量大，必须先有能上机的内核。
+- 验证：`check-patch-series.py` 本仓库 91 个补丁全部应用、应用后文件与草稿树逐字节一致；`validate-repo.py` 通过；
+  新 C 文件用 SDK 内核头 `-Wall -Wextra` 语法检查无警告（sweet_usb.c 只剩 SDK 里没有的私有 KPI 报错，与改动无关）。
+  **没做过真正的内核编译，也没上机。**
+
+### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
+- **0090 改**（根据另一台 K30 的 omp 分支实测）：
+  - `sweetusbsmmu` 默认改为 0（不碰 SMMU）。`=1` 只读报告，`=2` 还把 SID 0xe0 的 S2CR 改成旁路
+    （SMMUv2 正确偏移：SMR 0x800+4n、S2CR 0xc00+4n、TYPE 位[17:16]=1）。对方认定 USB 第一次 DMA
+    被 SMMU 拦下重启，但他们用的是 SMMUv3 偏移、旁路从没真正试过——这个 `=2` 是让 USB 能跑的候选修法。
+  - 去掉写 ahb2phy CBCR（0x6a004）的无用动作（对方 Run 21/24 证明写它无效、PHY 不写也能读写）；
+    改为只读 usb30_prim GDSC（**绝不写位 0**，对方 Run 22 写它关了电源域 panic）、需要时放开 AHB2PHY 的
+    复位位 0x6a000。
+  - `pu_rd/pu_wr` 改成显式单条 `ldr/str` 内联汇编：SMMU 全局寄存器由高通虚拟机监控器代管，只认最简单
+    的指令（HackiOS 的结论，不能让编译器选 dc zva / str wzr）。
+- **mkadt 默认内存段改为高位 0x140000000+3GiB**（真机验证过）。旧的低位窗口 0xb0000000 会跨过
+  0xBCC00000-0xC0000000 的空洞（第一段 DRAM 到 0xBCC00000 结束），很可能死机，现在只有 `--lowmem` / `--qemu` 用。
+- **mkadt 把 /product 的 artwork-display-gamut 从 P3 改成 sRGB**（ios-topaz 3eacb48 / 另一台 K30：
+  P3 时 CoreAnimation/WebKit 往 10 位色深表面画，图标/Safari 空白）。
+- **补了 MIT LICENSE**（与上游 ios-sweet 067c9b3 一致）。
+- 验证：91 个补丁全部应用、应用后与草稿树逐字节一致；mkadt 默认输出 dram-base 0x140000000；
+  picasso_usbphy.c SDK 语法检查无警告；validate-repo 通过。**仍未上机。**
+- 还没做（下批，均为通用、已确认值得移植）：sapphire 0159+0162（USB 总线复位后 ue0 恢复）、
+  0160（钥匙串写入）、0156（完整 AMFI）+clean-base 守护进程清单、0155（60 Hz）、0164（表面可换出）；
+  GPU 照 HackiOS redwood_adreno.c（APSL 2.0，同类 a6xx+GMU，寄存器地址与我们原厂设备树一致）移植到 0091 之上。
+
+### GitHub 新进展核对（2026-10-24）
+本地副本：`../.scratch/github-refs/`（minhtritt-omp = minhtritt 的 omp 分支工作树，hackios/、ios-topaz/、yincql-unixnu-picasso/）。
+- **minhtritt omp 分支（另一台真机 K30 5G，223 个新提交）**：
+  - USB 仍不通。他们自己的观测：PHY、电源、UTMI 握手（GENERAL_CFG 0x04→0x0d）都做完后 ep0 配置成功，
+    主机也能看到高速连接；只要发出第一个 DMA（ep0 的 STARTTRANSFER）手机就断电重启，shim 和他们的 UEFI 里也一样。
+  - 他们据此认定 apps SMMU（0x15000000）被锁死，但用的是 SMMUv3 的寄存器偏移（MMU-500 是 SMMUv2），
+    “S2CR 在 0x8700”其实是上下文银行区，绕过（bypass）也写错了位；**正确的 SMR/S2CR（0x800/0xc00）从没试过**。
+    按 SMMUv2 解读他们在 0x0 读到的 0x00260406，未匹配的流会出错（USFCFG=1）——这是推断，未验证。
+  - 0x140000000 起 3 GiB 的内存窗口在真机上反复可用；他们给出的内存段是 0x80000000+0x3cc00000、0xc0000000+2G、0x140000000+3G。
+    **我们 mkadt 不加 --highmem 时的 0xb0000000+0x4d000000 会跨过 0xbcc00000-0xc0000000 的空洞**，应把 --highmem 设为默认。
+  - 0x6a004 置位后 CLK_OFF 不变，PHY 照样能读写（对方 Run 21/24），0090 里写它没有用。
+  - 基带：PAS 启动成功（id 4，载入 0x8C000000+0xF800000），GLINK/QRTR/pd-mapper 都通；Wi-Fi 没出来（基带不启动 wlan_pd）。
+  - 他们的 `fastboot boot` 被拒（"Load Error"），靠 `fastboot flash boot`；但 YinCQL/UniXNU-picasso 写的是
+    `fastboot boot Mu-picasso-unixnu-0.img`（header v1）能启动——两边说法冲突，上机先试。
+  - 屏幕图标在 ADT 的 artwork-display-gamut 从 P3 改成 sRGB 后才出现（topaz mkadt 同样改法）。仓库无 LICENSE，只作参考。
+- **HackiOS（github.com/oosexgang/hackios-xnu-kernel，2026-10-22 开源，APSL 2.0）**：POCO X5 Pro（SM7325，Adreno 642L，有 GMU），
+  GPU 经 Mesa 画出 SpringBoard。`xnu/files/bsd/dev/redwood_adreno.c` 一步步做完 GMU 固件、HFI、开 GX、zap、SQE、命令处理器，
+  **GPU 相关地址和 picasso 原厂设备树完全一样**（gmu 0x3d6a000、gpucc 0x3d90000、gx/cx gdsc、kgsl-smmu 0x3da0000），
+  GMU 寄存器偏移与 0091 一致。它的经验：高通虚拟机监控器会代管 SMMU 全局寄存器（SMR/S2CR/CBAR），只能用最简单的
+  `ldr w,[x]` / `str w,[x]`，不能 `str wzr`；按这个办法它成功写了 GPU SMMU 的流表。**这也是 USB DMA 的可能解法**（给 SID 0xe0 建上下文）。
+- **ios-sapphire 0155-0171**：通用、值得移植的是 0159+0162（USB 总线复位后 ue0 恢复）、0160（钥匙串写入）、
+  0155（60 Hz 显示模式，动画更顺；一个块要手工合）、0156（完整 AMFI，要配合关掉崩溃循环的扩展/守护进程并重建 csstore）、
+  0164 的 SweetSurface 部分（表面内存可换出，防止越用越卡）；`tools/sapphire-clean-base.sh` 的守护进程清单和
+  BTAudioHALPlugin 导致 launchd 空转的修法应加进 `sweet-root-tweaks.py`。0157/0158/0161/0163/0165/音频与 SM6225 或它的 GPU 绑定。
+- **ios-topaz**：0948 = sapphire 0155；0949/0950 与它的 GPU 或 FocalTech 触屏绑定，不需要。
+- **ios-sweet 上游**：425b251 之后只加了 MIT LICENSE 和网站，我们仓库应补上 LICENSE。
+- **YinCQL/UniXNU-picasso**：另一条路线（iPadOS 17 内核 + UEFI），代码用不上；它 ADT 里的 GPU 地址（0x5000000）与原厂设备树不符，别照抄。
 
 ### 别人在 K30 5G 真机上的结论（github.com/minhtritt1996/ios-picasso，2026-10-20～22）
 这是**另一台** K30 5G（装 Droidian）上的观察，不是我们这台；本地参考副本在
@@ -101,9 +198,9 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - 根 `compatible` 必须是独立字符串列表且含 `xiaomi,sweet`（我们一直如此）；shim 不能往 ADT 写没读到的值（我们的 shim 不改 ADT）。
 - **命令行**：不要 `serial=3`（内核输出转到串口，屏幕上什么都看不到）；用 `debug=0x14e` 代替 `0xc`
   （0xc 出错后自动重启，画面留不住）；`cpus=8` 在对方机器上能用。
-- **USB**：写 `QSCRATCH_GENERAL_CFG`（0x0a6f8808）会在 2-3 秒后被 RPM 看门狗整机重启（我们只读不写）；
-  ahb2phy 时钟 GCC 0x6a004 默认关（0x80000002），关着时 SNPS PHY 寄存器读出 0x88888888 这类假值；
-  设备模式 ep0 命令超时，对方还在调（Run 21 未出结果）。**已更正 0083**（加回 ahb2phy，关着就不读 PHY）。
+- **USB**：对方认为写 `QSCRATCH_GENERAL_CFG`（0x0a6f8808）会在 2-3 秒后整机重启；ahb2phy（GCC 0x6a004）是 0x80000002；
+  设备模式 ep0 命令超时，对方还在调（Run 21 未出结果）。**这两条的解读已在上面 0090 一节修正**（读数是真值、
+  超时缺的是 UTMI 时钟、重启原因没分清），0090 用分步启动在真机上区分。
 - **用户空间卡在苹果 logo** 的原因依次是：数据迁移每次开机都跑（要写 ByHost 偏好，UUID 由 ADT 的
   unique-chip-id/chip-id 算出；我们的 ECID 和对方相同，按内核算法核对过 UUID 是
   `47A4033D-9F31-5A46-90F4-BE29CA615E78`，同样的算法也能算出 sweet 记录的 A9683613-...）、CommCenter 崩溃循环、
@@ -112,7 +209,7 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - 对方认为 `/product` 节点让 backboardd 要求 Metal 而黑屏；但 sweet 带 `/product` 能进主屏幕，对方那段时间还有别的改动，
   结论不可靠。先保留；上机黑屏时再用不带 d22ap.adt 的 ADT 对比。
 - 对方的 0085（帧缓冲缓存刷新）我们不需要：SweetSurface 把面板内存映射成 write-combine。
-  0086/0087（来自 ios-topaz：IOAcceleratorES 空服务省掉 QuartzCore 30 秒等待、SweetSurface 完善）是通用改进，未移植，候选。
+  0086/0087（来自 ios-topaz：IOAcceleratorES 空服务省掉 QuartzCore 30 秒等待、SweetSurface 完善）已在我们的 0088 里移植。
 - 对方说 Wi-Fi 搬不过来（以为是 cnss2）。原厂设备树是 `qcom,icnss@18800000` + WCN3990 蓝牙，
   与 topaz/sapphire 的 WCN3988 看起来是同一类（固件在基带处理器上，主机走 CE/HTC/WMI/HTT），**待验证**。
 - picasso 有调试串口 `qcom,qup_uart@888000`（msm-geni-console），sweet 没有。
@@ -176,9 +273,17 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   - 看屏幕：红底文字出现 = 帧缓冲地址正确；拍下 `ABL x0`、`x0 word0`（d00dfeed 表示 x0 就是设备树）和 `INITRD` 几行。
     x0 是设备树时才会有 "DRAM banks"、"RMTFS"、"PANEL"；这时据此核对 `--highmem` 默认的 0x1_40000000 + 3 GiB。
 - 第一次带内核的命令行建议：`debug=0x14e cpus=1 keepsyms=1 -noprogress ... picassotouchlog=1 picassovibtest=300`
-  （**不要 serial=3**）。新驱动出问题时可以逐个关：`picassotouch=0 picassovib=0 picassobl=0 picassocpufreq=0 sweetbattery=0 sweetusbnet=0`。
+  （**不要 serial=3**）。新驱动出问题时可以逐个关：`picassotouch=0 picassovib=0 picassobl=0 picassocpufreq=0 sweetbattery=0 sweetusbnet=0 sweetaccel=0`。
   屏幕/日志里要找的前缀：`PICASSO TOUCH:`、`PICASSO VIB:`、`PICASSO BL:`、`PICASSO CPUFREQ:`、`SWEET BATTERY: gauge`、
-  `SWEET FB: ... brightness?`、`SWEET USB:`、`SWEET USBNET:`。
+  `SWEET FB: ... brightness?`、`SWEET USB:`、`SWEET USBNET:`、`PICASSO GPU:`。
+- **USB 设备模式的上机顺序**（同一个内核，只改命令行；都要 `ufsrw=1 ufslogsecs=1` 让日志每秒落盘，
+  重启后从 recovery 用 `tools/sweet-log-pull.sh` 读）：先 `sweetusb=2 sweetusbstage=1 sweetusbslow=1500`，
+  看 `SWEET USB: SMMU`、`rail`、`HSPHY before/after` 几行；再依次 `sweetusbstage=2`、`3`、`4`、`5`，最后不加 stage。
+  哪一步之后 2-3 秒重启，日志最后一行 `stage N done` 就是它。若停在 2 就重启：是 GENERAL_CFG 本身，试 `sweetusbutmi=0`；
+  若 4/5 之后才重启：看 SMMU 那几行（S2CR 是 translate 且 CB 的 SCTLR.M=1 → USB 的 DMA 在走 UEFI 留下的页表，
+  下一步要给 SID 0xe0 做一个一级旁路的上下文，做法同 Linux arm-smmu 的 qcom bypass 处理）。
+- **GPU**：先 `picassogpu=1`（只读），再 `picassogpu=2 picassogpudelay=20 picassogpuslow=1200`，看 `GMU_ALWAYS_ON_COUNTER`
+  是否涨约 192000/10 ms、`CX power-up` 有没有失败。这两步都不需要固件。
 - 用户提供 GitHub 账号后：fork、推送 `picasso` 分支、`gh workflow run xnu.yml`，下载 `xnu-kernel` 产物，
   再 `tools/mkpayload.py`（命令行先用 `cpus=1`；触屏先加 `picassotouchlog=1`；想看真实电量加 `sweetbattery=1`；
   USB 默认只打印状态，要 USB 网络用 `sweetusb=2`）+ `shim/build_macos.py PAYLOAD`。

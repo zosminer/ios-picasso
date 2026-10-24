@@ -1,0 +1,831 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@ bsd/dev/picasso_touch.c			standard
+ bsd/dev/picasso_vib.c			standard
+ bsd/dev/picasso_backlight.c		standard
+ bsd/dev/picasso_cpufreq.c		standard
++bsd/dev/picasso_usbphy.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/picasso_usbphy.c
+@@ -0,0 +1,435 @@
++/*
++ * picasso（红米 K30 5G，SM7250）USB 设备模式的准备工作，由 sweet_usb.c 的
++ * sweet_usb_gadget_start() 调用（只在 sweetusb=2 时）：
++ *   1. 报告 USB 流（SID 0xe0）在 apps SMMU 里的配置（只读）；
++ *   2. 报告 HS PHY 三路电源（PM8150 L5A/L12A/L2A，SPMI 只读），可选 RPMh 投票；
++ *   3. Synopsys femto HS PHY（hsphy@88e3000）：EUD 检查、ahb2phy 时钟、复位 + 初始化；
++ *   4. 控制器软复位之后，把 DWC3 的 PIPE 时钟换成 UTMI 时钟（只有 USB 2.0 时必须）。
++ *
++ * 来源：
++ *   原厂设备树 hsphy@88e3000："qcom,usb-hsphy-snps-femto"，reg <0x88e3000 0x110>（PHY）和
++ *     <0x88e2000 0x4>（EUD 使能）；vdd = pm8150_l5（ldoa5，qcom,vdd-voltage-level 880000）、
++ *     vdda18 = pm8150_l12（ldoa12）、vdda33 = pm8150_l2（ldoa2）；resets = GCC 第 15 号
++ *     （gcc-lito.c：GCC_QUSB2PHY_PRIM_BCR 0x12000）；qcom,param-override-seq =
++ *     <0xc8 0x70 0x24 0x74 0x64 0x6c>（值, 偏移）。
++ *   原厂设备树 ssusb@a600000：iommus = <&apps_smmu 0xe0 0x0>；dwc3 子节点
++ *     maximum-speed = "high-speed"、usb-phy = <hsphy, usb_nop_phy>、snps,disable-clk-gating。
++ *   小米 picasso-r-oss：drivers/usb/phy/phy-msm-snps-hs.c 的 msm_hsphy_init()、msm_hsphy_reset()；
++ *     drivers/usb/dwc3/dwc3-msm.c 的 DWC3_CONTROLLER_POST_RESET_EVENT（只有高速/全速时
++ *     QSCRATCH_GENERAL_CFG：PIPE_UTMI_CLK_DIS -> PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW -> 清 DIS）。
++ *   ARM SMMUv2 / MMU-500 寄存器（Linux drivers/iommu/arm-smmu.h）。
++ *
++ * 另一台 K30 5G 的真机日志（github.com/minhtritt1996/ios-picasso，NOTES Run 6-21）：
++ *   - PHY 寄存器是 8 位的，经 ahb2phy 桥读出来每个字节重复四次：0x01010101、0x06060606、
++ *     0x88888888 就是 0x01、0x06、0x88。写入是生效的（Run 19 写 COMMON0 后读回 0xb0b0b0b0）。
++ *     ahb2phy 的 CBCR 读到 0x80000002（位 1 = 硬件控制，空闲时自动关），这时照样能读写。
++ *   - ABL 之后 PHY 已经是初始化好的样子：UTMI_CTRL0 SLEEPM=1、UTMI_CTRL5 POR=0、
++ *     CTRL2 SUSPEND_N=1。Run 20 做了完整的复位 + 初始化，没有出问题。
++ *   - 不切 UTMI 时钟时 ep0 的 SETEPCONFIG 一直超时（Run 6、18、19、20）；切了以后不超时
++ *     （Run 7，GENERAL_CFG 读回 0xd）。但切了的那几次（Run 7、11、17）都在 2-3 秒后整机重启。
++ *     那几次也正是控制器真正跑起来（ep0 配好、TRB 交给控制器、RUN_STOP）的几次，所以分不清
++ *     是写 GENERAL_CFG 本身，还是之后的 DMA / 中断。sweet_usb.c 的 sweetusbstage=N 能在每一步
++ *     之后停下来，一次只多走一步，用来在真机上找出是哪一步。
++ *   - 2026-10-24 omp 分支把原因缩到了一步：PHY、电源、UTMI 都做完、ep0 配置成功、电脑看到高速连接后，
++ *     控制器**第一次 DMA（STARTTRANSFER）**手机就断电重启，换低位内存也一样。他们判断是 apps SMMU
++ *     把 USB 流（SID 0xe0）拦下了。但他们用的是 SMMUv3 的偏移（S2CR 写到 0x8700、TYPE 放错位），
++ *     **正确的 SMMUv2 旁路从没试过**。所以这里的 SMMU 用正确偏移（SMR 0x800+4n、S2CR 0xc00+4n、
++ *     TYPE 在位[17:16]），sweetusbsmmu=2 时把 SID 0xe0 改成旁路——这是让 USB DMA 能跑的候选修法。
++ *     HackiOS（oosexgang，APSL 2.0）在同类芯片上证明：这些全局寄存器由高通虚拟机监控器代管，
++ *     只能用最简单的 ldr/str（不能 str wzr），所以 pu_rd/pu_wr 用显式内联汇编。
++ *
++ * boot-args（都只在 sweetusb=2 时起作用）：
++ *   sweetusbphy=0|1|2   0 只报告 PHY；1（默认）PHY 不是 Linux 初始化后的样子才复位重来；2 总是复位重来
++ *   sweetusbutmi=0|1|2  0 不动 GENERAL_CFG；1（默认）还没选 UTMI 时钟才切；2 总是按 Linux 顺序走一遍
++ *   sweetusbvreg=0|1|2  0（默认）只报告三路电源；1 读到没电的那路才 RPMh 投票；2 三路都投票
++ *   sweetusbsmmu=0|1|2  0（默认）不碰 SMMU；1 只读报告 SID 0xe0 的配置（读上百个寄存器有卡总线风险）；
++ *                       2 还把 SID 0xe0 改成旁路（候选修法，真机未验证）
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);	/* bsd/dev/sweet_rpmh.c */
++int picasso_usbphy_prepare(void);
++void picasso_usb_utmi_select(vm_offset_t qscratch);
++
++/* GCC（与 sweet_usb.c 相同的映射范围） */
++#define PU_GCC_PA               0x00100000
++#define PU_GCC_SIZE             0x00090000
++#define PU_AHB2PHY_BCR          0x6a000         /* GCC_USB_PHY_CFG_AHB2PHY_BCR，位 0/1 = 复位 */
++#define PU_AHB2PHY_CBCR         0x6a004         /* lito 没把它当闸门用；只读着看，别写（另一台 K30 Run 21/24） */
++#define PU_GDSCR                0x0f004         /* GCC_USB30_PRIM_GDSCR，位 0 SW_COLLAPSE（只读不写），位 31 供电状态 */
++#define PU_HSPHY_BCR            0x12000         /* GCC_QUSB2PHY_PRIM_BCR，位 0 = 复位 */
++#define PU_CBCR_EN              (1u << 0)
++#define PU_CBCR_OFF             (1u << 31)
++
++/* HS PHY 与 EUD（原厂设备树 hsphy@88e3000） */
++#define PU_PHY_PA               0x088e3000
++#define PU_PHY_SIZE             0x00000110
++#define PU_EUD_PA               0x088e2000
++#define PU_EUD_SIZE             0x00000004
++
++/* phy-msm-snps-hs.c 的寄存器（8 位） */
++#define UTMI_CTRL0              0x3c
++#define   SLEEPM                (1u << 0)
++#define UTMI_CTRL5              0x50
++#define   POR                   (1u << 1)
++#define CTRL_COMMON0            0x54
++#define   FSEL_MASK             (7u << 4)
++#define CTRL_COMMON1            0x58
++#define   VBUSVLDEXTSEL0        (1u << 4)
++#define   PLLBTUNE              (1u << 5)
++#define CTRL_COMMON2            0x5c
++#define   VREGBYPASS            (1u << 0)
++#define CTRL1                   0x60
++#define   VBUSVLDEXT0           (1u << 0)
++#define CTRL2                   0x64
++#define   USB2_SUSPEND_N        (1u << 2)
++#define   USB2_SUSPEND_N_SEL    (1u << 3)
++#define OVERRIDE_X0             0x6c
++#define OVERRIDE_X1             0x70
++#define OVERRIDE_X2             0x74
++#define OVERRIDE_X3             0x78
++#define PHY_CFG0                0x94
++#define   CMN_CTRL_OVERRIDE_EN  (1u << 1)
++#define REFCLK_CTRL             0xa0
++#define   REFCLK_SEL_MASK       (3u << 0)
++#define   REFCLK_SEL_DEFAULT    (2u << 0)
++
++/* 原厂设备树 qcom,param-override-seq：<值 偏移> 成对，按顺序写 */
++static const uint8_t pu_override_seq[][2] = {
++	{ 0xc8, OVERRIDE_X1 },
++	{ 0x24, OVERRIDE_X2 },
++	{ 0x64, OVERRIDE_X0 },
++};
++
++/* QSCRATCH_GENERAL_CFG（DWC3 + 0xf8808，dwc3-msm.c） */
++#define QS_GENERAL_CFG          0x08
++#define   PIPE_UTMI_CLK_SEL     (1u << 0)
++#define   PIPE3_PHYSTATUS_SW    (1u << 3)
++#define   PIPE_UTMI_CLK_DIS     (1u << 8)
++
++/* apps SMMU（原厂设备树 apps-smmu@15000000，reg 大小 0x100000，"qcom,qsmmu-v500"） */
++#define PU_SMMU_PA              0x15000000
++#define PU_SMMU_SIZE            0x00100000
++#define PU_USB_SID              0xe0u
++
++/* 显式的单条 ldr/str：SMMU 全局寄存器由高通虚拟机监控器代管，只认最简单的指令形式
++ * （HackiOS 的结论），所以不让编译器自选 dc zva 之类。 */
++static uint32_t
++pu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(base + off) : "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pu_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	__asm__ volatile ("str %w0, [%1]" :: "r"(v), "r"(base + off) : "memory");
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ---------------------------------------------------------------------------
++ * 1. SMMU（smmu=1 只读报告，smmu=2 还旁路）。USB 控制器的 DMA（事件缓冲、TRB、数据）都经过 apps SMMU。
++ * 另一台 K30 的真机结论：控制器第一次 DMA 就被 SMMU 拦下，整机重启。UEFI 的 UsbConfigDxe 给 USB
++ * 建过一个 "HAL IOMMU usb domain"，退出时是否拆掉不知道；SID 0xe0 可能指向一个会 fault 的上下文。
++ * 这里把匹配 SID 0xe0 的 SMR/S2CR 和它的上下文打印出来；smmu=2 时把 S2CR 改成旁路（TYPE=1），
++ * 让控制器的 DMA 直接用物理地址。写用显式 str（见 pu_wr）。
++ * ------------------------------------------------------------------------- */
++static void
++pu_smmu_report(int smmu)
++{
++	vm_offset_t s = ml_io_map(PU_SMMU_PA, PU_SMMU_SIZE);
++	if (s == 0) {
++		printf("SWEET USB: SMMU map failed\n");
++		return;
++	}
++	uint32_t scr0 = pu_rd(s, 0x00), id0 = pu_rd(s, 0x20), id1 = pu_rd(s, 0x24);
++	unsigned nsmr = id0 & 0xffu, ncb = id1 & 0xffu;
++	unsigned pgshift = (id1 & (1u << 31)) ? 16 : 12;
++	unsigned npage = 1u << (((id1 >> 28) & 7u) + 1);
++	bool exids = (id0 & (1u << 8)) && (scr0 & (1u << 3));
++	printf("SWEET USB: SMMU sCR0 0x%08x (CLIENTPD %u USFCFG %u) IDR0 0x%08x IDR1 0x%08x: %u SMR, %u CB, %u KiB pages x %u\n",
++	    scr0, scr0 & 1u, (scr0 >> 10) & 1u, id0, id1, nsmr, ncb, 1u << (pgshift - 10), npage);
++	if (scr0 == 0xffffffffu || id0 == 0xffffffffu || nsmr == 0 || nsmr > 128) {
++		printf("SWEET USB: SMMU registers unreadable or unexpected; no SMR scan\n");
++		return;
++	}
++	/* 上下文银行在 base + npage 页处；超出设备树给的 1 MiB 就不读 */
++	bool cb_ok = ((uint64_t)(2u * npage) << pgshift) <= PU_SMMU_SIZE;
++	unsigned matches = 0;
++	for (unsigned i = 0; i < nsmr; i++) {
++		uint32_t smr = pu_rd(s, 0x800 + 4 * i), s2cr = pu_rd(s, 0xc00 + 4 * i);
++		bool valid;
++		uint32_t id, mask;
++		if (exids) {
++			valid = (s2cr >> 10) & 1u;
++			id = smr & 0xffffu;
++			mask = smr >> 16;
++		} else {
++			valid = smr >> 31;
++			id = smr & 0x7fffu;
++			mask = (smr >> 16) & 0x7fffu;
++		}
++		if (!valid || ((id ^ PU_USB_SID) & ~mask & 0xffffu) != 0) {
++			continue;
++		}
++		matches++;
++		unsigned type = (s2cr >> 16) & 3u, cb = s2cr & 0xffu;
++		static const char *const s2cr_type[] = { "translate", "bypass", "fault", "reserved" };
++		printf("SWEET USB: SMMU SMR%u id 0x%x mask 0x%x -> S2CR 0x%08x (%s, CB %u)\n",
++		    i, id, mask, s2cr, s2cr_type[type], cb);
++		if (smmu >= 2 && type != 1) {
++			/* SMMUv2：S2CR.TYPE 在位[17:16]，1 = BYPASS。改成旁路 = USB DMA 走物理地址。 */
++			uint32_t want = (s2cr & ~(3u << 16)) | (1u << 16);
++			pu_wr(s, 0xc00 + 4 * i, want);
++			printf("SWEET USB: SMMU SMR%u S2CR 0x%08x -> 0x%08x (bypass, sweetusbsmmu=2)\n",
++			    i, s2cr, pu_rd(s, 0xc00 + 4 * i));
++		}
++		if (type != 0 || cb >= ncb || !cb_ok) {
++			continue;
++		}
++		uint32_t cbar = pu_rd(s, (1u << pgshift) + 4 * cb);
++		vm_offset_t c = s + ((vm_offset_t)npage << pgshift) + ((vm_offset_t)cb << pgshift);
++		uint32_t sctlr = pu_rd(c, 0x00), tcr = pu_rd(c, 0x30), fsr = pu_rd(c, 0x58);
++		uint64_t ttbr0 = pu_rd(c, 0x20) | ((uint64_t)pu_rd(c, 0x24) << 32);
++		uint64_t far = pu_rd(c, 0x60) | ((uint64_t)pu_rd(c, 0x64) << 32);
++		static const char *const cbar_type[] = { "S2 only", "S1, S2 bypass", "S1, S2 fault", "nested" };
++		printf("SWEET USB: SMMU CB%u CBAR 0x%08x (%s, VMID %u) SCTLR 0x%08x (M %u CFCFG %u) TCR 0x%08x TTBR0 0x%016llx FSR 0x%08x FAR 0x%016llx\n",
++		    cb, cbar, cbar_type[(cbar >> 16) & 3u], cbar & 0xffu, sctlr, sctlr & 1u, (sctlr >> 7) & 1u,
++		    tcr, ttbr0, fsr, far);
++		if (sctlr & 1u) {
++			printf("SWEET USB: SMMU: USB DMA goes through stage-1 page tables at 0x%llx (left by UEFI?)\n",
++			    ttbr0 & 0x0000fffffffff000ULL);
++		}
++	}
++	if (matches == 0) {
++		printf("SWEET USB: SMMU: no SMR matches SID 0x%x; unmatched streams %s\n",
++		    PU_USB_SID, (scr0 & (1u << 10)) ? "fault (USFCFG=1)" : "bypass (USFCFG=0)");
++	}
++}
++
++/* ---------------------------------------------------------------------------
++ * 2. 三路电源。PMIC5 LDO（PM8150 = SID 0，LDOn 在 0x4000 + (n-1) * 0x100）：
++ *   TYPE 0x04、SUBTYPE 0x05、STATUS1 0x08（位 7 VREG_READY）、VSET_LB/UB 0x40/0x41（毫伏）、
++ *   EN_CTL 0x46（位 7）。由 RPMh 管，EN_CTL 不一定反映真实状态，VREG_READY 才是。
++ * L5A 同时给 UFS PHY（ufsphy_mem vdda-phy），UFS 能用它就一定开着。
++ * ------------------------------------------------------------------------- */
++static const struct {
++	const char *name;
++	unsigned    base;
++	const char *res;        /* cmd-db 资源名 */
++	unsigned    mv;         /* phy-msm-snps-hs.c 的最低电压 */
++} pu_rails[] = {
++	{ "L5A vdd", 0x4400, "ldoa5", 880 },
++	{ "L12A vdda18", 0x4b00, "ldoa12", 1800 },
++	{ "L2A vdda33", 0x4100, "ldoa2", 3050 },
++};
++#define PU_RAIL_SID     0u
++
++static void
++pu_rails_check(int vote)
++{
++	bool spmi = sweet_spmi_init() == 0;
++	for (unsigned i = 0; i < sizeof(pu_rails) / sizeof(pu_rails[0]); i++) {
++		uint8_t type = 0, sub = 0, st = 0, lb = 0, ub = 0, en = 0;
++		bool ok = spmi &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x04, &type) &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x05, &sub) &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x08, &st) &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x40, &lb) &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x41, &ub) &&
++		    !sweet_spmi_read(PU_RAIL_SID, pu_rails[i].base + 0x46, &en);
++		bool ready = ok && (st & 0x80u);
++		if (ok) {
++			printf("SWEET USB: rail %-11s (%s) type 0x%02x/0x%02x STATUS1 0x%02x (%s) VSET %u mV EN_CTL 0x%02x\n",
++			    pu_rails[i].name, pu_rails[i].res, type, sub, st, ready ? "ready" : "NOT ready",
++			    lb | (ub << 8), en);
++		} else {
++			printf("SWEET USB: rail %-11s (%s) not readable over SPMI\n", pu_rails[i].name, pu_rails[i].res);
++		}
++		/* 读不到状态时只有 sweetusbvreg=2 才投票 */
++		if (vote == 2 || (vote == 1 && ok && !ready)) {
++			int error = sweet_rpmh_vreg_enable(pu_rails[i].res, pu_rails[i].mv);
++			printf("SWEET USB: rail %s RPMh vote %u mV: %s (%d)\n", pu_rails[i].res, pu_rails[i].mv,
++			    error ? "failed" : "done", error);
++		}
++	}
++}
++
++/* ---------------------------------------------------------------------------
++ * 3. HS PHY
++ * ------------------------------------------------------------------------- */
++static vm_offset_t pu_phy;
++static unsigned pu_phy_errors;
++
++static uint32_t
++pu_phy_rd(uint32_t off)
++{
++	return pu_rd(pu_phy, off) & 0xffu;      /* 8 位寄存器，桥把字节重复了四次 */
++}
++
++/* msm_usb_write_readback()：只改 mask 里的位，再读回核对 */
++static void
++pu_phy_rmw(uint32_t off, uint32_t mask, uint32_t val)
++{
++	pu_wr(pu_phy, off, (pu_phy_rd(off) & ~mask) | val);
++	uint32_t got = pu_phy_rd(off) & mask;
++	if (got != val) {
++		pu_phy_errors++;
++		printf("SWEET USB: HSPHY write 0x%02x/0x%02x to 0x%02x read back 0x%02x\n", val, mask, off, got);
++	}
++}
++
++static void
++pu_phy_dump(const char *when)
++{
++	printf("SWEET USB: HSPHY %s UTMI0 %02x UTMI5 %02x COMMON0 %02x COMMON1 %02x COMMON2 %02x CTRL1 %02x CTRL2 %02x CFG0 %02x REFCLK %02x X0..X3 %02x %02x %02x %02x\n",
++	    when, pu_phy_rd(UTMI_CTRL0), pu_phy_rd(UTMI_CTRL5), pu_phy_rd(CTRL_COMMON0),
++	    pu_phy_rd(CTRL_COMMON1), pu_phy_rd(CTRL_COMMON2), pu_phy_rd(CTRL1), pu_phy_rd(CTRL2),
++	    pu_phy_rd(PHY_CFG0), pu_phy_rd(REFCLK_CTRL), pu_phy_rd(OVERRIDE_X0), pu_phy_rd(OVERRIDE_X1),
++	    pu_phy_rd(OVERRIDE_X2), pu_phy_rd(OVERRIDE_X3));
++}
++
++/* msm_hsphy_init() 走完之后各寄存器应有的样子 */
++static bool
++pu_phy_initialized(void)
++{
++	if (!(pu_phy_rd(UTMI_CTRL0) & SLEEPM) || (pu_phy_rd(UTMI_CTRL5) & POR) ||
++	    !(pu_phy_rd(CTRL2) & USB2_SUSPEND_N) || (pu_phy_rd(CTRL2) & USB2_SUSPEND_N_SEL) ||
++	    (pu_phy_rd(PHY_CFG0) & CMN_CTRL_OVERRIDE_EN) || (pu_phy_rd(CTRL_COMMON0) & FSEL_MASK) ||
++	    (pu_phy_rd(REFCLK_CTRL) & REFCLK_SEL_MASK) != REFCLK_SEL_DEFAULT ||
++	    !(pu_phy_rd(CTRL_COMMON2) & VREGBYPASS)) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(pu_override_seq) / sizeof(pu_override_seq[0]); i++) {
++		if (pu_phy_rd(pu_override_seq[i][1]) != pu_override_seq[i][0]) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++pu_phy_init(vm_offset_t gcc)
++{
++	/* msm_hsphy_reset()：复位 100-150 us */
++	pu_wr(gcc, PU_HSPHY_BCR, pu_rd(gcc, PU_HSPHY_BCR) | 1u);
++	delay(150);
++	pu_wr(gcc, PU_HSPHY_BCR, pu_rd(gcc, PU_HSPHY_BCR) & ~1u);
++	delay(10);
++	pu_phy_errors = 0;
++	/* msm_hsphy_init()，顺序与原厂驱动一致 */
++	pu_phy_rmw(PHY_CFG0, CMN_CTRL_OVERRIDE_EN, CMN_CTRL_OVERRIDE_EN);
++	pu_phy_rmw(UTMI_CTRL5, POR, POR);
++	pu_phy_rmw(CTRL_COMMON0, FSEL_MASK, 0);                 /* 19.2 MHz 参考时钟 */
++	pu_phy_rmw(CTRL_COMMON1, PLLBTUNE, PLLBTUNE);
++	pu_phy_rmw(REFCLK_CTRL, REFCLK_SEL_MASK, REFCLK_SEL_DEFAULT);
++	pu_phy_rmw(CTRL_COMMON1, VBUSVLDEXTSEL0, VBUSVLDEXTSEL0);
++	pu_phy_rmw(CTRL1, VBUSVLDEXT0, VBUSVLDEXT0);
++	for (unsigned i = 0; i < sizeof(pu_override_seq) / sizeof(pu_override_seq[0]); i++) {
++		/* hsusb_phy_write_seq()：整字节直接写 */
++		pu_wr(pu_phy, pu_override_seq[i][1], pu_override_seq[i][0]);
++		if (pu_phy_rd(pu_override_seq[i][1]) != pu_override_seq[i][0]) {
++			pu_phy_errors++;
++		}
++	}
++	pu_phy_rmw(CTRL_COMMON2, VREGBYPASS, VREGBYPASS);
++	pu_phy_rmw(CTRL2, USB2_SUSPEND_N_SEL | USB2_SUSPEND_N, USB2_SUSPEND_N_SEL | USB2_SUSPEND_N);
++	pu_phy_rmw(UTMI_CTRL0, SLEEPM, SLEEPM);
++	pu_phy_rmw(UTMI_CTRL5, POR, 0);
++	pu_phy_rmw(CTRL2, USB2_SUSPEND_N_SEL, 0);
++	pu_phy_rmw(PHY_CFG0, CMN_CTRL_OVERRIDE_EN, 0);
++	delay(1000);    /* 原厂驱动不等；给 PLL 锁定、UTMI 时钟出来留 1 ms */
++}
++
++/* 返回 0：可以继续启动控制器；非 0：PHY 不能用，不要再碰控制器 */
++int
++picasso_usbphy_prepare(void)
++{
++	int mode = 1, vote = 0, smmu = 0;
++	(void)PE_parse_boot_argn("sweetusbphy", &mode, sizeof(mode));
++	(void)PE_parse_boot_argn("sweetusbvreg", &vote, sizeof(vote));
++	(void)PE_parse_boot_argn("sweetusbsmmu", &smmu, sizeof(smmu));
++
++	if (smmu) {
++		pu_smmu_report(smmu);
++	}
++	pu_rails_check(vote);
++
++	vm_offset_t gcc = ml_io_map(PU_GCC_PA, PU_GCC_SIZE);
++	vm_offset_t eud = ml_io_map(PU_EUD_PA, PU_EUD_SIZE);
++	pu_phy = ml_io_map(PU_PHY_PA, PU_PHY_SIZE);
++	if (gcc == 0 || eud == 0 || pu_phy == 0) {
++		printf("SWEET USB: HSPHY map failed\n");
++		return -1;
++	}
++	/* usb30_prim GDSC 开着，PHY 的 APB 才应答；ABL 一般已开。位 0 = SW_COLLAPSE，
++	 * **绝不能写**（另一台 K30 的 Run 22 写它把 USB 电源域关了，直接 panic）；位 31 = 只读供电状态。 */
++	uint32_t gdsc = pu_rd(gcc, PU_GDSCR);
++	printf("SWEET USB: usb30_prim GDSC 0x%08x (%s)\n", gdsc, (gdsc & (1u << 31)) ? "on" : "OFF");
++	/* lito 没有独立的 ahb2phy 分支时钟（0x6a004 CBCR 不是闸门，写它无效，另一台 K30 Run 21/24）；
++	 * 桥由 GCC_USB_PHY_CFG_AHB2PHY_BCR（0x6a000）的复位位管，复位没放开就放开它。 */
++	uint32_t bcr = pu_rd(gcc, PU_AHB2PHY_BCR);
++	if (bcr & 3u) {
++		pu_wr(gcc, PU_AHB2PHY_BCR, bcr & ~3u);
++		delay(1000);
++	}
++	printf("SWEET USB: ahb2phy BCR 0x%08x -> 0x%08x, CBCR 0x%08x\n",
++	    bcr, pu_rd(gcc, PU_AHB2PHY_BCR), pu_rd(gcc, PU_AHB2PHY_CBCR));
++	/* EUD（嵌入式 USB 调试）打开时 PHY 归 EUD 管，原厂驱动直接返回成功，不碰 PHY */
++	uint32_t eud_en = pu_rd(eud, 0);
++	if (eud_en) {
++		printf("SWEET USB: EUD enabled (0x%08x); HSPHY left alone\n", eud_en);
++		return 0;
++	}
++
++	pu_phy_dump("before");
++	bool good = pu_phy_initialized();
++	if (mode == 0 || (mode == 1 && good)) {
++		printf("SWEET USB: HSPHY %s; not reset (sweetusbphy=%d)\n",
++		    good ? "already initialized" : "NOT initialized", mode);
++		return 0;
++	}
++	pu_phy_init(gcc);
++	pu_phy_dump("after");
++	good = pu_phy_initialized();
++	printf("SWEET USB: HSPHY reset + init %s (%u readback errors)\n", good ? "done" : "FAILED", pu_phy_errors);
++	return good ? 0 : -1;
++}
++
++/* ---------------------------------------------------------------------------
++ * 4. PIPE 时钟改走 UTMI：设备树 maximum-speed = "high-speed"，没有 SS PHY，DWC3 的
++ * PIPE 时钟域没有时钟，端点命令就一直不完成（另一台 K30 5G 的 Run 6/18-20）。
++ * 在控制器软复位之后调用（dwc3-msm.c 是在 POST_RESET 事件里做的）。
++ * ------------------------------------------------------------------------- */
++void
++picasso_usb_utmi_select(vm_offset_t qs)
++{
++	int mode = 1;
++	(void)PE_parse_boot_argn("sweetusbutmi", &mode, sizeof(mode));
++	uint32_t cfg = pu_rd(qs, QS_GENERAL_CFG);
++	bool selected = (cfg & (PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW)) == (PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	if (mode == 0 || (mode == 1 && selected)) {
++		printf("SWEET USB: GENERAL_CFG 0x%08x left as is (UTMI clock %s, sweetusbutmi=%d)\n",
++		    cfg, selected ? "selected" : "NOT selected", mode);
++		return;
++	}
++	/* 先停掉 PIPE/UTMI 时钟，再切选择，再放开，避免切换时出毛刺（与 dwc3-msm.c 相同） */
++	pu_wr(qs, QS_GENERAL_CFG, pu_rd(qs, QS_GENERAL_CFG) | PIPE_UTMI_CLK_DIS);
++	delay(5);
++	pu_wr(qs, QS_GENERAL_CFG, pu_rd(qs, QS_GENERAL_CFG) | PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW);
++	delay(5);
++	pu_wr(qs, QS_GENERAL_CFG, pu_rd(qs, QS_GENERAL_CFG) & ~PIPE_UTMI_CLK_DIS);
++	printf("SWEET USB: GENERAL_CFG 0x%08x -> 0x%08x (PIPE clock from UTMI)\n", cfg, pu_rd(qs, QS_GENERAL_CFG));
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -1,5 +1,6 @@
+ /*
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
++ * picasso：改为给 USB HS PHY 的 PM8150 L5A/L12A/L2A 投票（picasso_usbphy.c，boot-arg sweetusbvreg）。
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
+  */
+@@ -17,7 +18,12 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_RSC_PA       0x18220000u
+ #define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+-#define RH_DICT_PA      0x0c3f000cu
++/* picasso：lito 的原厂设备树里 cmd-db 是 reserved-memory@80860000（大小 0x20000，
++ * compatible "qcom,cmd-db"，no-map），没有 sweet 那个 0x0c3f000c 的定位字，
++ * 所以直接用设备树给的地址，仍然只认魔数和版本。这块不在 XNU 管的内存里
++ * （mkadt.py：0xb0000000 起，或 --highmem 的 0x140000000 起）。 */
++#define RH_DB_PA        0x80860000u
++#define RH_DB_SIZE      0x20000u
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+@@ -46,7 +52,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_VRM          4u
+ #define RH_TIMEOUT_US   100000u
+ 
+-static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
++static vm_offset_t rh_rsc, rh_tcs, rh_db;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+@@ -106,11 +112,8 @@ rh_map(void)
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
+-		rh_dict = ml_io_map(RH_DICT_PA, 8);
+-	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
+-		printf("SWEET RPMH: RSC/locator mapping failed\n");
++	if (!rh_rsc || !rh_tcs) {
++		printf("SWEET RPMH: RSC mapping failed\n");
+ 		return ENOMEM;
+ 	}
+ 	uint32_t id = rh_read(rh_rsc, 0);
+@@ -129,21 +132,14 @@ rh_map(void)
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
+-		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+-		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+-		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+-		    (uint64_t)pa + size > 0x100000000ULL) {
+-			printf("SWEET RPMH: invalid cmd-db locator\n");
+-			return EINVAL;
+-		}
+-		rh_db = ml_io_map(pa, size);
++		/* picasso：地址来自原厂设备树（见 RH_DB_PA）；never scan physical RAM. */
++		_Static_assert(RH_DB_SIZE >= RH_DB_HEADER && RH_DB_SIZE <= RH_DB_MAX, "cmd-db size");
++		printf("SWEET RPMH: cmd-db at %#x size %#x (device tree reserved-memory)\n", RH_DB_PA, RH_DB_SIZE);
++		rh_db = ml_io_map(RH_DB_PA, RH_DB_SIZE);
+ 		if (!rh_db) {
+ 			return ENOMEM;
+ 		}
+-		rh_db_size = size;
++		rh_db_size = RH_DB_SIZE;
+ 	}
+ 	uint32_t db_version = rh_read(rh_db, 0);
+ 	uint32_t magic = rh_read(rh_db, 4);
+@@ -234,7 +230,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for this VRM resource in TCS%u\n", t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -320,16 +316,34 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: VRM ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+-	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources.
++	 * picasso：只允许 USB HS PHY 的三路 PM8150 LDO（原厂设备树 hsphy@88e3000 的 vdd/vdda18/vdda33，
++	 * 电压范围取 phy-msm-snps-hs.c 与设备树 regulator-min/max 的交集）。sweet 的 ldoc11
++	 * 在 picasso 上是另一路电（pm8150a_l11，给 vdd-3.3-ch1），不再允许。 */
++	static const struct {
++		const char *res;
++		unsigned min_mv, max_mv;
++	} allowed[] = {
++		{ "ldoa5", 880, 880 },          /* pm8150_l5，qcom,vdd-voltage-level 880000 */
++		{ "ldoa12", 1712, 1800 },       /* pm8150_l12，1704..1800 mV 且设备树最低 1710 */
++		{ "ldoa2", 3050, 3300 },        /* pm8150_l2，3050..3300 mV */
++	};
++	bool ok = false;
++	for (unsigned i = 0; res && i < sizeof(allowed) / sizeof(allowed[0]); i++) {
++		if (!strcmp(res, allowed[i].res) && mv >= allowed[i].min_mv && mv <= allowed[i].max_mv) {
++			ok = true;
++		}
++	}
++	if (!ok) {
++		printf("SWEET RPMH: %s %u mV not allowed (only ldoa5/ldoa12/ldoa2 for the USB PHY)\n",
++		    res ? res : "(null)", mv);
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -110,6 +110,8 @@ sweet_spmi_init_once(void)
+ #define SP_WLED_SID     5u
+ #define SP_WLED_CTRL    0xd8u
+ #define SP_WLED_SINK    0xd9u
++/* picasso：PM8150（qcom,pm8150@0，SID 0）的 LDO，LDOn 在 0x4000 + (n-1) * 0x100 */
++#define SP_RAIL_SID     0u
+ 
+ static bool
+ sp_read_allowed(unsigned sid, unsigned peripheral)
+@@ -123,6 +125,10 @@ sp_read_allowed(unsigned sid, unsigned peripheral)
+ 	if (sid == SP_WLED_SID) {
+ 		return peripheral == SP_WLED_CTRL || peripheral == SP_WLED_SINK;
+ 	}
++	if (sid == SP_RAIL_SID) {
++		/* picasso：PM8150 的 L2A/L5A/L12A（USB HS PHY 三路电源），只读，见 picasso_usbphy.c */
++		return peripheral == 0x41 || peripheral == 0x44 || peripheral == 0x4b;
++	}
+ 	return sid == SP_VIB_SID && peripheral == SP_VIB_PERIPH;
+ }
+ 
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -8,7 +8,8 @@
+  * picasso（SM7250）：同一个 DWC3（0x0a600000，原厂设备树同样 maximum-speed = "high-speed"），
+  * USB2 PHY 换成 SNPS femto（hsphy@88e3000，phy-msm-snps-hs.c）；GDSC 仍是 0x0f004，
+  * 时钟偏移按 gcc-lito.c 改；ahb2phy（0x6a004）gcc-lito.c 没列但硬件里有。
+- * 设备模式（sweetusb=2）在 SM7250 上还需要完整的 SNPS PHY 初始化，尚未移植。ABL uses this
++ * 设备模式（sweetusb=2）在 SM7250 上先由 picasso_usbphy.c 准备 PHY、电源，软复位后把
++ * PIPE 时钟换成 UTMI；sweetusbstage=N 可以在第 N 步之后停下（见 sweet_usb_gadget_start）。ABL uses this
+  * controller for fastboot; this probe only reports what state it is left
+  * in after `fastboot boot`. It never writes a register, and it touches the
+  * DWC3 / PHY register blocks only when the GCC status registers say their
+@@ -45,6 +46,8 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern void SweetUSBNetPublish(const char *interface, const uint8_t *address);	/* iokit/Kernel/arm/SweetUSBNet.cpp */
++extern int picasso_usbphy_prepare(void);			/* bsd/dev/picasso_usbphy.c */
++extern void picasso_usb_utmi_select(vm_offset_t qscratch);	/* bsd/dev/picasso_usbphy.c */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define GCC_PA                  0x00100000
+@@ -129,11 +132,14 @@ sweet_usb_probe(void)
+ 	if (enabled >= 2) {
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+-	/* picasso：PHY 寄存器挂在 ahb2phy 桥后面，这个时钟关着就不读（读到的只是总线填充值）。
+-	 * 注意：不要写 QSCRATCH_GENERAL_CFG（0x0a6f8808）：另一台 K30 5G 上写它会在 2-3 秒后
+-	 * 被 RPM 看门狗整机重启（github.com/minhtritt1996/ios-picasso，Run 11/17）。本文件只读它。 */
+-	if (cbcr[USB_CBCR_AHB2PHY] & CBCR_CLK_OFF) {
+-		printf("SWEET USB: ahb2phy clock off; SNPS HSPHY not read\n");
++	/* picasso：PHY 寄存器挂在 ahb2phy 桥后面。另一台 K30 5G 上这个 CBCR 是 0x80000002
++	 * （位 1 硬件控制：空闲时 CLK_OFF=1，访问时自动开），照样读出了真实值（8 位寄存器，
++	 * 每个字节重复四次，github.com/minhtritt1996/ios-picasso Run 19/20）。所以只要软件使能或
++	 * 硬件控制有一个打开就读；两个都关才不读。
++	 * QSCRATCH_GENERAL_CFG（0x0a6f8808）在这里只读；写它只在 sweetusb=2 的
++	 * picasso_usb_utmi_select() 里（那几次重启的分析见 picasso_usbphy.c 开头）。 */
++	if (!(cbcr[USB_CBCR_AHB2PHY] & 3u)) {
++		printf("SWEET USB: ahb2phy clock disabled; SNPS HSPHY not read\n");
+ 		return;
+ 	}
+ 	vm_offset_t phy = ml_io_map(HSPHY_PA, HSPHY_SIZE);
+@@ -142,9 +148,9 @@ sweet_usb_probe(void)
+ 	}
+ 	/* phy-msm-snps-hs.c：UTMI_CTRL0 0x3c、UTMI_CTRL5 0x50（POR 位 1）、HS_PHY_CTRL_COMMON0 0x54、
+ 	 * HS_PHY_CTRL2 0x64、CFG0 0x94、REFCLK_CTRL 0xa0、PARAMETER_OVERRIDE_X0..X3 0x6c..0x78 */
+-	printf("SWEET USB: SNPS HSPHY UTMI0 0x%08x UTMI5 0x%08x COMMON0 0x%08x CTRL2 0x%08x CFG0 0x%08x REFCLK 0x%08x\n",
+-	    usb_rd(phy, 0x3c), usb_rd(phy, 0x50), usb_rd(phy, 0x54), usb_rd(phy, 0x64),
+-	    usb_rd(phy, 0x94), usb_rd(phy, 0xa0));
++	printf("SWEET USB: SNPS HSPHY UTMI0 0x%02x UTMI5 0x%02x COMMON0 0x%02x CTRL2 0x%02x CFG0 0x%02x REFCLK 0x%02x\n",
++	    usb_rd(phy, 0x3c) & 0xffu, usb_rd(phy, 0x50) & 0xffu, usb_rd(phy, 0x54) & 0xffu,
++	    usb_rd(phy, 0x64) & 0xffu, usb_rd(phy, 0x94) & 0xffu, usb_rd(phy, 0xa0) & 0xffu);
+ 	printf("SWEET USB: SNPS HSPHY OVERRIDE X0..X3 0x%02x 0x%02x 0x%02x 0x%02x\n",
+ 	    usb_rd(phy, 0x6c) & 0xffu, usb_rd(phy, 0x70) & 0xffu, usb_rd(phy, 0x74) & 0xffu,
+ 	    usb_rd(phy, 0x78) & 0xffu);
+@@ -163,6 +169,14 @@ sweet_usb_probe(void)
+  * ep0.c).
+  */
+ #define GCTL            0xc110
++#define   GCTL_DSBLCLKGTNG      (1u << 0)
++#define GSTS            0xc118
++#define   GSTS_BUSERRADDRVLD    (1u << 7)
++#define GBUSERRADDR0    0xc130
++#define GBUSERRADDR1    0xc134
++#define GUSB2PHYCFG     0xc200
++#define   GUSB2PHYCFG_SUSPHY    (1u << 6)
++#define   GUSB2PHYCFG_ENBLSLPM  (1u << 8)
+ #define GEVNTADRLO      0xc400
+ #define GEVNTADRHI      0xc404
+ #define GEVNTSIZ        0xc408
+@@ -236,6 +250,7 @@ sweet_usb_probe(void)
+ 
+ static struct {
+ 	vm_offset_t dwc;
++	vm_offset_t qs;             /* picasso：QSCRATCH，超时时打印 GENERAL_CFG 用 */
+ 	vm_offset_t dma;
+ 	uint64_t    dma_pa;
+ 	uint32_t    evt_pos;
+@@ -301,7 +316,10 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	/* picasso：超时多半是 PHY/UTMI 时钟没在走；把相关寄存器一起打出来 */
++	printf("SWEET USB: ep%u cmd 0x%x timeout (DEPCMD 0x%08x GUSB2PHYCFG 0x%08x DSTS 0x%08x GSTS 0x%08x GENERAL_CFG 0x%08x)\n",
++	    ep, cmd & 0xf, dwc_rd(DEPCMD(ep)), dwc_rd(GUSB2PHYCFG), dwc_rd(DSTS), dwc_rd(GSTS),
++	    ud.qs ? usb_rd(ud.qs, 0x08) : 0);
+ 	return -1;
+ }
+ 
+@@ -797,7 +815,14 @@ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+ 	uint32_t ticks = 0;
++	bool bus_error_seen = false;
+ 	for (;;) {
++		/* picasso：控制器 DMA 出错（SMMU 拦下、地址不对）时 GSTS 位 7 会置起，地址在 GBUSERRADDR */
++		if (!bus_error_seen && (ticks % 1000) == 0 && (dwc_rd(GSTS) & GSTS_BUSERRADDRVLD)) {
++			bus_error_seen = true;
++			printf("SWEET USB: DMA bus error at 0x%08x%08x (GSTS 0x%08x)\n",
++			    dwc_rd(GBUSERRADDR1), dwc_rd(GBUSERRADDR0), dwc_rd(GSTS));
++		}
+ 		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
+ 		if (count) {
+ 			ud_sync(UD_EVT, UD_EVT_SIZE);
+@@ -866,12 +891,49 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	}
+ }
+ 
++/*
++ * picasso：分步启动。另一台 K30 5G 上控制器一跑起来 2-3 秒就整机重启，原因没分清
++ * （见 picasso_usbphy.c 开头）。sweetusbstage=N 在第 N 步之后停下，不再往下走：
++ *   1 PHY、电源、SMMU 报告完（还没写控制器）
++ *   2 控制器软复位、PIPE 时钟换成 UTMI、GUSB2PHYCFG/GCTL（还没有 DMA）
++ *   3 事件缓冲、ep0 配置（端点命令能完成说明时钟在走；还没有 DMA）
++ *   4 ep0 的 SETUP TRB 交给控制器（控制器第一次 DMA 读内存）
++ *   5 VBUS 覆盖 + RUN_STOP（电脑能看到设备，之后都是正常运行）
++ * sweetusbslow=毫秒 让每一步之后等一会儿，日志线程（ufslogsecs=1）能先把这一步写到盘上，
++ * 重启后从日志最后一行就知道死在哪一步。默认 0 = 不停、不等。
++ */
++static int ud_stage_max, ud_slow_ms;
++
++static bool
++ud_stage(int n, const char *what)
++{
++	printf("SWEET USB: stage %d done: %s (GSTS 0x%08x DSTS 0x%08x)\n", n, what, dwc_rd(GSTS), dwc_rd(DSTS));
++	if (ud_slow_ms > 0) {
++		ud_sleep_ms((unsigned)ud_slow_ms);
++	}
++	if (ud_stage_max > 0 && n >= ud_stage_max) {
++		printf("SWEET USB: stopping after stage %d (sweetusbstage=%d)\n", n, ud_stage_max);
++		return true;
++	}
++	return false;
++}
++
+ static void
+ sweet_usb_gadget_start(vm_offset_t dwc)
+ {
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	(void)PE_parse_boot_argn("sweetusbstage", &ud_stage_max, sizeof(ud_stage_max));
++	(void)PE_parse_boot_argn("sweetusbslow", &ud_slow_ms, sizeof(ud_slow_ms));
++	if (ud_slow_ms > 10000) {
++		ud_slow_ms = 10000;
++	}
++	ud.qs = ml_io_map(QSCRATCH_PA, 0x100);
++	if (ud.qs == 0) {
++		printf("SWEET USB: QSCRATCH map failed\n");
++		return;
++	}
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+@@ -882,9 +944,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+-	ud_if_create();
++	printf("SWEET USB: DMA area 0x%llx..0x%llx\n", ud.dma_pa, ud.dma_pa + UD_SIZE);
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/* picasso：PHY 的 EUD/时钟/复位/初始化，三路电源与 SMMU 报告（bsd/dev/picasso_usbphy.c） */
++	if (picasso_usbphy_prepare() != 0) {
++		printf("SWEET USB: HSPHY not usable; controller not started\n");
++		return;
++	}
++	if (ud_stage(1, "HSPHY, rails and SMMU")) {
++		return;
++	}
++
++	/* Device controller soft reset (global setup stays as ABL left it). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -895,6 +966,18 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
+ 	}
++	/* picasso：只有 USB 2.0（maximum-speed = "high-speed"），PIPE 时钟改由 UTMI 供给 */
++	picasso_usb_utmi_select(ud.qs);
++	/* Linux dwc3 发端点命令时会清掉 SUSPHY/ENBLSLPM（PHY 睡着时命令不完成）；这里干脆一直清掉。
++	 * 设备树 snps,disable-clk-gating：关掉控制器的时钟门控。 */
++	uint32_t phycfg = dwc_rd(GUSB2PHYCFG), gctl = dwc_rd(GCTL);
++	dwc_wr(GUSB2PHYCFG, phycfg & ~(GUSB2PHYCFG_SUSPHY | GUSB2PHYCFG_ENBLSLPM));
++	dwc_wr(GCTL, gctl | GCTL_DSBLCLKGTNG);
++	printf("SWEET USB: GUSB2PHYCFG 0x%08x -> 0x%08x GCTL 0x%08x -> 0x%08x\n",
++	    phycfg, dwc_rd(GUSB2PHYCFG), gctl, dwc_rd(GCTL));
++	if (ud_stage(2, "soft reset, UTMI clock, PHY config")) {
++		return;
++	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));
+@@ -918,25 +1001,34 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
++	if (ud_stage(3, "event buffer and ep0 configured")) {
++		return;
++	}
+ 	ud_start_setup();
+-
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
+-	if (qs != 0) {
+-		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+-		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+-		    hs, ss, usb_rd(qs, 0x08));
+-		*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
+-		*(volatile uint32_t *)(qs + QSCRATCH_SS_PHY_CTRL) = ss | LANE0_PWR_PRESENT;
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		printf("SWEET USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
+-		    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
++	if (ud_stage(4, "ep0 SETUP TRB given to the controller (first DMA)")) {
++		return;
+ 	}
++	ud_if_create();
++
++	vm_offset_t qs = ud.qs;
++	uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
++	printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
++	    hs, ss, usb_rd(qs, 0x08));
++	*(volatile uint32_t *)(qs + QSCRATCH_HS_PHY_CTRL) = hs | UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++	/* picasso：只有高速口，dwc3-msm.c 只在 maximum_speed >= SUPER 时才设 LANE0_PWR_PRESENT，这里不设 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET USB: VBUS override on: HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x\n",
++	    usb_rd(qs, QSCRATCH_HS_PHY_CTRL), usb_rd(qs, QSCRATCH_SS_PHY_CTRL));
+ 
+ 	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
+ 	for (i = 0; i < 500 && (dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
++	/* 停在第 5 步：控制器在跑、会往事件缓冲里写，但没有线程处理事件（电脑那边枚举不成功） */
++	if (ud_stage(5, "VBUS override and RUN_STOP")) {
++		return;
++	}
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

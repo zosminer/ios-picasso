@@ -1,0 +1,149 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,10 +39,15 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void picasso_backlight_power(int on);        /* bsd/dev/picasso_backlight.c */
+ extern "C" void picasso_cpufreq_display(int on);       /* bsd/dev/picasso_cpufreq.c */
++extern "C" int picasso_backlight_set(int level);         /* bsd/dev/picasso_backlight.c，0..4095 */
++/* picasso：qcom,mdss-dsi-panel-peak-brightness = 4200000（0.0001 nit）= 420 nit，对应 WLED 满量程 0xfff */
++#define SWEET_FB_MAX_NITS               420
++#define SWEET_FB_BL_MAX                 0xfff
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <libkern/c++/OSCollectionIterator.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+@@ -124,12 +129,31 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
+ };
+ 
++/*
++ * From ios-topaz 0105: CoreBrightness (-[CBDisplayContaineriOS findBacklight]) matches
++ * {IOPropertyMatch: {backlight-control: true}} and requires the class to
++ * conform to AppleARMBacklight; without it there is no display module and
++ * the brightness slider is dead. It then sets "brightness-nits" here
++ * (SetBLDriverNitsValue) and IOMFBBrightnessLevel on the framebuffer.
++ * topaz 0110 made it opt-in (sweetbl=1): with it CoreBrightness also runs digital dimming,
++ * a colour filter over every frame, which the CPU renderer could not afford on topaz.
++ */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
+ /*
+  * The graphics accelerator's service class (from ios-topaz 0138). QuartzCore (CAMetalContextCreate,
+  * once per process) polls IOServiceMatching("IOAcceleratorES") 300 times,
+@@ -219,6 +243,22 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	/* picasso：亮度（尼特，16.16 定点）由 CoreBrightness 写到 IOMFBBrightnessLevel，见 setProperties */
++	setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
++	uint32_t blOn = 0;
++	(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++	AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
++	if (bl != NULL && bl->init()) {
++		bl->fFB = this;
++		bl->setProperty("backlight-control", true);
++		bl->setProperty("brightness-nits", (unsigned long long)200, 32);
++		bl->setProperty("max-nits", (unsigned long long)SWEET_FB_MAX_NITS, 32);
++		if (bl->attach(this)) {
++			bl->registerService();
++			IOLog("SWEET FB: AppleARMBacklight published (brightness slider, sweetbl=1)\n");
++		}
++	}
++	OSSafeReleaseNULL(bl);
+ 	/* ios-topaz 0138：空的 IOAcceleratorES，省掉 QuartzCore 每次启动 30 秒的等待；sweetaccel=0 不发布 */
+ 	uint32_t accelOn = 1;
+ 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
+@@ -622,4 +662,75 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	return ret;
+ }
++/* From ios-topaz 0105: log what CoreBrightness sets (first 24 keys). */
++static void
++sweet_bl_log(const char *who, OSDictionary *d)
++{
++	static uint32_t logs;
++	if (d == NULL || logs >= 24) {
++		return;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++	OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		if (logs++ < 24) {
++			IOLog("SWEET BL: %s set %s = %s %llu\n", who, k->getCStringNoCopy(),
++			    v ? v->getMetaClass()->getClassName() : "null", n ? n->unsigned64BitValue() : 0);
++		}
++	}
++	OSSafeReleaseNULL(it);
++}
++
++/*
++ * picasso（照 ios-topaz 0104，但走 WLED 而不是 DSI 的 DCS 0x51）：
++ * CoreBrightness 把亮度以尼特（16.16）写到 IOMFBBrightnessLevel，换算成 WLED 的 0..0xfff。
++ */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("iomfb", d);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("IOMFBBrightnessLevel")) : NULL;
++	if (n == NULL) {
++		return kIOReturnUnsupported;
++	}
++	uint64_t v = n->unsigned64BitValue();
++	setProperty("IOMFBBrightnessLevel", v, 32);
++	uint64_t level = (v * SWEET_FB_BL_MAX) / ((uint64_t)SWEET_FB_MAX_NITS << 16);
++	if (level > SWEET_FB_BL_MAX) {
++		level = SWEET_FB_BL_MAX;
++	}
++	if (level < 1) {
++		level = 1;      /* 0 是关背光；熄屏走 RequestPowerChange */
++	}
++	(void)picasso_backlight_set((int)level);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	sweet_bl_log("backlight", d);
++	OSNumber *n = d ? OSDynamicCast(OSNumber, d->getObject("brightness-nits")) : NULL;
++	if (n != NULL && fFB != NULL) {
++		OSDictionary *m = OSDictionary::withCapacity(1);
++		/* same 16.16 nits scale as IOMFBBrightnessLevel */
++		uint64_t v = n->unsigned64BitValue();
++		if (v < 0x10000) {
++			v <<= 16;               /* plain nits */
++		}
++		OSNumber *nn = OSNumber::withNumber(v, 64);
++		if (m != NULL && nn != NULL) {
++			m->setObject("IOMFBBrightnessLevel", nn);
++			fFB->setProperties(m);
++		}
++		OSSafeReleaseNULL(nn);
++		OSSafeReleaseNULL(m);
++		setProperty("brightness-nits", n);
++	}
++	return kIOReturnSuccess;
++}
+ #endif /* SWEET */

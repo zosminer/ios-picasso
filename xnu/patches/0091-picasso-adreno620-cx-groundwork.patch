@@ -1,0 +1,459 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/picasso_vib.c			standard
+ bsd/dev/picasso_backlight.c		standard
+ bsd/dev/picasso_cpufreq.c		standard
+ bsd/dev/picasso_usbphy.c		standard
++bsd/dev/picasso_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/picasso_gpu.c
+@@ -0,0 +1,427 @@
++/*
++ * picasso（红米 K30 5G，SM7250 "lito"）Adreno 620 的准备工作，boot-arg picassogpu=N，默认 0 = 完全不碰。
++ *
++ * 和 ios-sapphire 的 Adreno 610（SM6225，github.com/Angelpro09xd/ios-sapphire 补丁 0145）不同：
++ * A620 有 GMU（qcom,gmu@3d6a000，一颗 Cortex-M3，固件 a650_gmu.bin）。GX 域（GPU 核心本体、
++ * 它的 PLL0 和 gfx3d 时钟、gfx.lvl 电压轨）由 GMU 固件通过它自己的 RSC/PDC 向 RPMh 申请，
++ * 主机这边的 gpucc-lito 里根本没有 GX 核心时钟（只有 CX 侧：cxo、ahb、cx_gmu、GMU 时钟源、
++ * PLL1、SMMU 投票）。所以 sapphire 那种“主机自己开 GX、直接读 RBBM”的做法在这里走不通，
++ * 真正让 GPU 跑起来要先把 GMU 固件启动起来（Linux drivers/gpu/drm/msm/adreno/a6xx_gmu.c）。
++ * 这个文件只做头两步，都不需要固件：
++ *
++ *   picassogpu=1  只读：GCC 里 GPU 相关的分支和投票位、GPU CC 的分支/RCG/PLL1/两个 GDSC。
++ *                 从不访问 0x3d00000-0x3d8ffff（GPU/GMU 寄存器，所在电源域关着时一读就挂总线）。
++ *   picassogpu=2  再把 CX 域和 GMU 的时钟打开（GPLL0 投票、GCC 的 GPU 总线时钟、CX GDSC、
++ *                 cxo/ahb、GMU 时钟 200 MHz、cx_gmu、SMMU 投票），把 GMU 的 CM3 保持在复位，
++ *                 然后读 GMU 的 CX/AO 寄存器和它的常开计数器（19.2 MHz：10 ms 应该涨约 192000）。
++ *                 最后把所有改过的寄存器恢复成 ABL 留下的样子（picassogpukeep=1 则保持上电）。
++ *                 不开 GX 域、不碰 gfx.lvl、不加载任何固件。
++ *   picassogpudelay=N  开机后等 N 秒再开始（默认 0）
++ *   picassogpuslow=N   每一步之后等 N 毫秒（默认 0；要看是哪一步出事时用 1200，配合 ufslogsecs=1）
++ *
++ * 寄存器来源（只取偏移和位定义，没有拷贝代码）：
++ *   原厂设备树：qcom,gpucc@3d90000（"qcom,lito-gpucc"）、gpu_cx_gdsc@3d9106c（hw-ctrl-addr 3d91540）、
++ *     gpu_gx_gdsc@3d9100c（domain-addr 3d91508、sw-reset 3d91008、parent-supply = gfx.lvl）、
++ *     qcom,kgsl-3d0@3d00000（chipid 0x06020001，中断 SPI 300）、qcom,gmu@3d6a000（0x30000）、
++ *     kgsl 时钟 mem_clk = GCC_DDRSS_GPU_AXI_CLK、mem_iface_clk = GCC_GPU_MEMNOC_GFX_CLK、
++ *     gmu_clk = GPU_CC_CX_GMU_CLK、gpu_cc_ahb、smmu_vote = GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK。
++ *   小米 picasso-r-oss drivers/clk/qcom/gcc-lito.c：gpu_cfg_ahb 0x71004（常开）、
++ *     GPLL0 给 GPU 的投票 0x52000 位 15、GPLL0_DIV 位 16、memnoc_gfx 0x7100c、snoc_dvm_gfx 0x71018、
++ *     ddrss_gpu_axi 0x71154、gpu_iref 0x8c014、GCC_GPU_MISC 0x71028。
++ *   同一内核 drivers/clk/qcom/gpucc-lito.c：分支 0x1004/0x1058/0x1064/0x1078/0x107c/0x1088/0x108c/
++ *     0x1090/0x1098/0x109c/0x5000，GMU RCG 0x1120（父时钟编号 0 TCXO、1 PLL0、3 PLL1、5 GPLL0、
++ *     6 GPLL0_DIV；200 MHz = GPLL0_DIV / 1.5），PLL1 在 0x100，cx_gmu 的 WAKEUP/SLEEP 都设 0xF。
++ *   Linux drivers/gpu/drm/msm/registers/adreno/a6xx_gmu.xml：GMU 寄存器的双字偏移，地址相对
++ *     GPU 基址 0x3d00000（a6xx_gmu.c 的 mmio_offset）。
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void picasso_gpu_init(void);
++
++#define PG_GCC_PA               0x00100000
++#define PG_GCC_SIZE             0x00090000
++#define PG_GPUCC_PA             0x03d90000
++#define PG_GPUCC_SIZE           0x00009000
++#define PG_GPU_PA               0x03d00000      /* GMU 寄存器偏移相对这里 */
++#define PG_GMU_PA               0x03d6a000      /* 原厂设备树 kgsl_gmu_reg */
++#define PG_GMU_SIZE             0x00030000
++
++#define CBCR_EN                 (1u << 0)
++#define CBCR_OFF                (1u << 31)
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_PWR_ON             (1u << 31)
++#define RCG_UPDATE              (1u << 0)
++#define RCG_ROOT_OFF            (1u << 31)
++
++/* GCC（gcc-lito.c） */
++#define GCC_GPU_CFG_AHB         0x71004
++#define GCC_GPU_MEMNOC_GFX      0x7100c
++#define GCC_GPU_SNOC_DVM_GFX    0x71018
++#define GCC_GPU_MISC            0x71028
++#define GCC_DDRSS_GPU_AXI       0x71154
++#define GCC_GPU_IREF            0x8c014
++#define GCC_VOTE                0x52000
++#define   VOTE_GPU_GPLL0        (1u << 15)
++#define   VOTE_GPU_GPLL0_DIV    (1u << 16)
++
++/* GPU CC（gpucc-lito.c 和原厂设备树） */
++#define CC_PLL1_MODE            0x0100
++#define CC_PLL1_L               0x0104
++#define CC_CXO_AON              0x1004
++#define CC_GX_GDSCR             0x100c
++#define CC_GX_VSENSE            0x1058
++#define CC_GX_GMU               0x1064
++#define CC_CX_GDSCR             0x106c
++#define CC_AHB                  0x1078
++#define CC_CRC_AHB              0x107c
++#define CC_CX_APB               0x1088
++#define CC_CX_SNOC_DVM          0x108c
++#define CC_SLEEP                0x1090
++#define CC_CX_GMU               0x1098
++#define   CX_GMU_WAKE_SLEEP     (0xfu << 8 | 0xfu << 4)
++#define CC_CXO                  0x109c
++#define CC_GMU_RCG_CMD          0x1120
++#define CC_GMU_RCG_CFG          0x1124
++#define   GMU_SRC_GPLL0_DIV     6u
++#define   GMU_DIV_1P5           2u      /* 寄存器里放 2 * 分频 - 1 */
++#define CC_GX_CLAMP_IO          0x1508
++#define CC_CX_GDS_HW_CTRL       0x1540  /* CX GDSC 的状态在这里（设备树 hw-ctrl-addr） */
++#define CC_SMMU_VOTE            0x5000
++
++/* GMU（a6xx_gmu.xml，双字偏移，相对 GPU 基址） */
++#define GMU_CM3_SYSRESET        0x1f800
++#define GMU_CM3_BOOT_CONFIG     0x1f801
++#define GMU_CM3_FW_INIT_RESULT  0x1f81c
++#define GMU_CM3_CFG             0x1f82d
++#define GMU_AO_COUNTER_L        0x1f888
++#define GMU_AO_COUNTER_H        0x1f889
++#define GMU_SPTPRAC_STATUS      0x1f8d0
++#define GMU_RPMH_CTRL           0x1f8e8
++#define GMU_RPMH_POWER_STATE    0x1f8ec
++#define GMU_HFI_CTRL_STATUS     0x1f980
++#define GMU_GENERAL_7           0x1f9cc
++#define GMU_AO_HOST_INT_STATUS  0x23b05
++#define GMU_AO_CX_BUSY_STATUS   0x23b0c
++
++static vm_offset_t pg_gcc, pg_cc, pg_gmu;
++static int pg_slow_ms;
++
++static uint32_t
++pg_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return v;
++}
++
++static void
++pg_wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++pg_rmw(vm_offset_t b, uint32_t off, uint32_t clear, uint32_t set)
++{
++	pg_wr(b, off, (pg_rd(b, off) & ~clear) | set);
++}
++
++static bool
++pg_poll(vm_offset_t b, uint32_t off, uint32_t mask, uint32_t want, unsigned us)
++{
++	for (unsigned i = 0; i <= us; i++) {
++		if ((pg_rd(b, off) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++pg_sleep_ms(unsigned ms)
++{
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* 每一步之后：让日志线程有时间把这一步写到盘上 */
++static void
++pg_step(void)
++{
++	if (pg_slow_ms > 0) {
++		pg_sleep_ms((unsigned)pg_slow_ms);
++	}
++}
++
++/* GMU 寄存器：字节地址 = 0x3d00000 + 4 * 偏移，落在 GMU 映射（0x3d6a000 起）里 */
++static uint32_t
++gmu_rd(uint32_t reg)
++{
++	return pg_rd(pg_gmu, 4 * reg - (PG_GMU_PA - PG_GPU_PA));
++}
++
++static void
++gmu_wr(uint32_t reg, uint32_t v)
++{
++	pg_wr(pg_gmu, 4 * reg - (PG_GMU_PA - PG_GPU_PA), v);
++}
++
++/* ---------------------------------------------------------------- 1. 时钟树 */
++
++enum { K_RAW, K_BRANCH, K_GDSC, K_RCG, K_PLL };
++static const struct {
++	uint8_t     gcc;    /* 1 = GCC，0 = GPU CC */
++	uint8_t     kind;
++	uint32_t    off;
++	const char *name;
++} pg_regs[] = {
++	{ 1, K_BRANCH, GCC_GPU_CFG_AHB, "gcc_gpu_cfg_ahb" },
++	{ 1, K_BRANCH, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx" },
++	{ 1, K_BRANCH, GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx" },
++	{ 1, K_BRANCH, GCC_DDRSS_GPU_AXI, "gcc_ddrss_gpu_axi" },
++	{ 1, K_BRANCH, GCC_GPU_IREF, "gcc_gpu_iref" },
++	{ 1, K_RAW, GCC_GPU_MISC, "gcc_gpu_misc" },
++	{ 1, K_RAW, GCC_VOTE, "gcc_vote (b15 gpll0, b16 gpll0_div)" },
++	{ 0, K_PLL, CC_PLL1_MODE, "gpucc_pll1_mode" },
++	{ 0, K_RAW, CC_PLL1_L, "gpucc_pll1_l" },
++	{ 0, K_RCG, CC_GMU_RCG_CMD, "gpucc_gmu_rcg_cmd" },
++	{ 0, K_RAW, CC_GMU_RCG_CFG, "gpucc_gmu_rcg_cfg" },
++	{ 0, K_BRANCH, CC_CXO_AON, "gpucc_cxo_aon" },
++	{ 0, K_BRANCH, CC_CXO, "gpucc_cxo" },
++	{ 0, K_BRANCH, CC_AHB, "gpucc_ahb" },
++	{ 0, K_BRANCH, CC_CRC_AHB, "gpucc_crc_ahb" },
++	{ 0, K_BRANCH, CC_CX_APB, "gpucc_cx_apb" },
++	{ 0, K_BRANCH, CC_CX_SNOC_DVM, "gpucc_cx_snoc_dvm" },
++	{ 0, K_BRANCH, CC_SLEEP, "gpucc_sleep" },
++	{ 0, K_BRANCH, CC_CX_GMU, "gpucc_cx_gmu" },
++	{ 0, K_BRANCH, CC_GX_GMU, "gpucc_gx_gmu" },
++	{ 0, K_BRANCH, CC_GX_VSENSE, "gpucc_gx_vsense" },
++	{ 0, K_BRANCH, CC_SMMU_VOTE, "gpucc_hlos1_vote_gpu_smmu" },
++	{ 0, K_GDSC, CC_CX_GDSCR, "gpucc_cx_gdscr" },
++	{ 0, K_RAW, CC_CX_GDS_HW_CTRL, "gpucc_cx_gds_hw_ctrl (b31 = CX on)" },
++	{ 0, K_GDSC, CC_GX_GDSCR, "gpucc_gx_gdscr" },
++	{ 0, K_RAW, CC_GX_CLAMP_IO, "gpucc_gx_clamp_io" },
++};
++
++static void
++pg_dump(const char *when)
++{
++	printf("PICASSO GPU: --- clock tree (%s)\n", when);
++	for (unsigned i = 0; i < sizeof(pg_regs) / sizeof(pg_regs[0]); i++) {
++		uint32_t v = pg_rd(pg_regs[i].gcc ? pg_gcc : pg_cc, pg_regs[i].off);
++		const char *s = "";
++		switch (pg_regs[i].kind) {
++		case K_BRANCH: s = (v & CBCR_OFF) ? " off" : " running"; break;
++		case K_GDSC: s = (v & GDSC_PWR_ON) ? " PWR_ON" : " collapsed"; break;
++		case K_RCG: s = (v & RCG_ROOT_OFF) ? " root off" : (v & RCG_UPDATE) ? " update pending" : " root on"; break;
++		case K_PLL: s = (v & 1u) ? " outctrl" : " off/unconfigured"; break;
++		default: break;
++		}
++		printf("PICASSO GPU:   %-36s %s 0x%05x = 0x%08x%s\n", pg_regs[i].name,
++		    pg_regs[i].gcc ? "gcc" : "gpucc", pg_regs[i].off, v, s);
++	}
++}
++
++/* ---------------------------------------------------------------- 2. CX 域和 GMU 时钟 */
++
++/* 改动前的值，停车时原样写回 */
++static uint32_t sv_vote, sv_axi, sv_memnoc, sv_snoc, sv_cxo, sv_ahb, sv_gmu_cfg, sv_cx_gmu, sv_smmu, sv_cx_gdscr;
++static bool cx_touched;
++
++static bool
++pg_branch_on(vm_offset_t b, uint32_t off, const char *name, unsigned us)
++{
++	pg_rmw(b, off, 0, CBCR_EN);
++	bool ok = pg_poll(b, off, CBCR_OFF, 0, us);
++	printf("PICASSO GPU:   %s on: 0x%08x %s\n", name, pg_rd(b, off), ok ? "running" : "STILL OFF");
++	pg_step();
++	return ok;
++}
++
++static bool
++pg_power_up_cx(void)
++{
++	printf("PICASSO GPU: --- power up CX and the GMU clocks (GX stays off)\n");
++	sv_vote = pg_rd(pg_gcc, GCC_VOTE);
++	sv_axi = pg_rd(pg_gcc, GCC_DDRSS_GPU_AXI);
++	sv_memnoc = pg_rd(pg_gcc, GCC_GPU_MEMNOC_GFX);
++	sv_snoc = pg_rd(pg_gcc, GCC_GPU_SNOC_DVM_GFX);
++	sv_cxo = pg_rd(pg_cc, CC_CXO);
++	sv_ahb = pg_rd(pg_cc, CC_AHB);
++	sv_gmu_cfg = pg_rd(pg_cc, CC_GMU_RCG_CFG);
++	sv_cx_gmu = pg_rd(pg_cc, CC_CX_GMU);
++	sv_smmu = pg_rd(pg_cc, CC_SMMU_VOTE);
++	sv_cx_gdscr = pg_rd(pg_cc, CC_CX_GDSCR);
++	cx_touched = true;
++
++	/* GCC：GPLL0 和 GPLL0_DIV 给 GPU CC（GMU 时钟从 GPLL0_DIV 来），GPU 的总线时钟 */
++	pg_rmw(pg_gcc, GCC_VOTE, 0, VOTE_GPU_GPLL0 | VOTE_GPU_GPLL0_DIV);
++	printf("PICASSO GPU:   gcc vote 0x%08x -> 0x%08x\n", sv_vote, pg_rd(pg_gcc, GCC_VOTE));
++	pg_step();
++	/* 投票型分支：没人用的时候可能一直读到 CLK_OFF，结果不作数 */
++	(void)pg_branch_on(pg_gcc, GCC_DDRSS_GPU_AXI, "gcc_ddrss_gpu_axi", 200);
++	(void)pg_branch_on(pg_gcc, GCC_GPU_MEMNOC_GFX, "gcc_gpu_memnoc_gfx", 200);
++	(void)pg_branch_on(pg_gcc, GCC_GPU_SNOC_DVM_GFX, "gcc_gpu_snoc_dvm_gfx", 200);
++
++	/* CX GDSC：清 SW_COLLAPSE，状态看 CX_GDS_HW_CTRL 位 31（设备树 qcom,gds-timeout = 500 us） */
++	pg_rmw(pg_cc, CC_CX_GDSCR, GDSC_SW_COLLAPSE, 0);
++	bool ok = pg_poll(pg_cc, CC_CX_GDS_HW_CTRL, GDSC_PWR_ON, GDSC_PWR_ON, 500);
++	printf("PICASSO GPU:   gpu_cx_gdsc on: gdscr 0x%08x hw_ctrl 0x%08x %s\n",
++	    pg_rd(pg_cc, CC_CX_GDSCR), pg_rd(pg_cc, CC_CX_GDS_HW_CTRL), ok ? "PWR_ON" : "NO PWR_ON");
++	pg_step();
++	if (!ok) {
++		return false;
++	}
++	/* 这两路在 CX 域里，CX 没电之前一直是关的 */
++	if (!pg_branch_on(pg_cc, CC_CXO, "gpucc_cxo", 200) ||
++	    !pg_branch_on(pg_cc, CC_AHB, "gpucc_ahb", 200)) {
++		return false;
++	}
++	/* GMU 时钟源：GPLL0_DIV / 1.5 = 200 MHz（Linux a6xx_gmu_resume 用的启动频率） */
++	pg_wr(pg_cc, CC_GMU_RCG_CFG, (GMU_SRC_GPLL0_DIV << 8) | GMU_DIV_1P5);
++	pg_rmw(pg_cc, CC_GMU_RCG_CMD, 0, RCG_UPDATE);
++	ok = pg_poll(pg_cc, CC_GMU_RCG_CMD, RCG_UPDATE, 0, 500);
++	printf("PICASSO GPU:   gmu_clk_src GPLL0_DIV/1.5 = 200 MHz: cmd 0x%08x cfg 0x%08x %s\n",
++	    pg_rd(pg_cc, CC_GMU_RCG_CMD), pg_rd(pg_cc, CC_GMU_RCG_CFG), ok ? "updated" : "UPDATE STUCK");
++	pg_step();
++	if (!ok) {
++		return false;
++	}
++	pg_rmw(pg_cc, CC_CX_GMU, CX_GMU_WAKE_SLEEP, CX_GMU_WAKE_SLEEP);    /* gpucc-lito 探测时的推荐值 */
++	if (!pg_branch_on(pg_cc, CC_CX_GMU, "gpucc_cx_gmu", 200)) {
++		return false;
++	}
++	(void)pg_branch_on(pg_cc, CC_SMMU_VOTE, "gpucc_hlos1_vote_gpu_smmu", 200);
++	return true;
++}
++
++static void
++pg_gmu_reads(void)
++{
++	printf("PICASSO GPU: --- GMU (CX side) reads\n");
++	pg_step();
++	uint32_t sysreset = gmu_rd(GMU_CM3_SYSRESET);
++	/* 先把 CM3 按在复位里：ITCM 里没有固件，放开就会乱跑（Linux a6xx_gmu_fw_start 冷启动第一步也是写 1） */
++	gmu_wr(GMU_CM3_SYSRESET, 1);
++	printf("PICASSO GPU:   CM3_SYSRESET 0x%08x -> 0x%08x (1 = CM3 held in reset)\n",
++	    sysreset, gmu_rd(GMU_CM3_SYSRESET));
++	pg_step();
++	printf("PICASSO GPU:   CM3_BOOT_CONFIG 0x%08x CM3_FW_INIT_RESULT 0x%08x CM3_CFG 0x%08x GENERAL_7 0x%08x\n",
++	    gmu_rd(GMU_CM3_BOOT_CONFIG), gmu_rd(GMU_CM3_FW_INIT_RESULT), gmu_rd(GMU_CM3_CFG),
++	    gmu_rd(GMU_GENERAL_7));
++	printf("PICASSO GPU:   SPTPRAC_PWR_CLK_STATUS 0x%08x (b6 GX GDSC off, b7 GX clock off) RPMH_CTRL 0x%08x RPMH_POWER_STATE 0x%08x\n",
++	    gmu_rd(GMU_SPTPRAC_STATUS), gmu_rd(GMU_RPMH_CTRL), gmu_rd(GMU_RPMH_POWER_STATE));
++	printf("PICASSO GPU:   HFI_CTRL_STATUS 0x%08x AO_HOST_INTERRUPT_STATUS 0x%08x AO_GPU_CX_BUSY_STATUS 0x%08x\n",
++	    gmu_rd(GMU_HFI_CTRL_STATUS), gmu_rd(GMU_AO_HOST_INT_STATUS), gmu_rd(GMU_AO_CX_BUSY_STATUS));
++	pg_step();
++	uint32_t lo1 = gmu_rd(GMU_AO_COUNTER_L), hi1 = gmu_rd(GMU_AO_COUNTER_H);
++	pg_sleep_ms(10);
++	uint32_t lo2 = gmu_rd(GMU_AO_COUNTER_L), hi2 = gmu_rd(GMU_AO_COUNTER_H);
++	printf("PICASSO GPU:   GMU_ALWAYS_ON_COUNTER 0x%08x%08x -> 0x%08x%08x in 10 ms (delta %u; 19.2 MHz = ~192000)\n",
++	    hi1, lo1, hi2, lo2, lo2 - lo1);
++	pg_step();
++}
++
++/* 原样写回 ABL 留下的值；CX GDSC 最后关 */
++static void
++pg_park(void)
++{
++	if (!cx_touched) {
++		return;
++	}
++	printf("PICASSO GPU: --- parking: back to what ABL left\n");
++	pg_wr(pg_cc, CC_SMMU_VOTE, sv_smmu);
++	pg_wr(pg_cc, CC_CX_GMU, sv_cx_gmu);
++	pg_wr(pg_cc, CC_GMU_RCG_CFG, sv_gmu_cfg);
++	pg_rmw(pg_cc, CC_GMU_RCG_CMD, 0, RCG_UPDATE);
++	(void)pg_poll(pg_cc, CC_GMU_RCG_CMD, RCG_UPDATE, 0, 500);
++	pg_wr(pg_cc, CC_AHB, sv_ahb);
++	pg_wr(pg_cc, CC_CXO, sv_cxo);
++	pg_wr(pg_cc, CC_CX_GDSCR, sv_cx_gdscr);
++	pg_wr(pg_gcc, GCC_GPU_SNOC_DVM_GFX, sv_snoc);
++	pg_wr(pg_gcc, GCC_GPU_MEMNOC_GFX, sv_memnoc);
++	pg_wr(pg_gcc, GCC_DDRSS_GPU_AXI, sv_axi);
++	pg_rmw(pg_gcc, GCC_VOTE, VOTE_GPU_GPLL0 | VOTE_GPU_GPLL0_DIV,
++	    sv_vote & (VOTE_GPU_GPLL0 | VOTE_GPU_GPLL0_DIV));
++	printf("PICASSO GPU:   cx gdscr 0x%08x hw_ctrl 0x%08x, gcc vote 0x%08x\n",
++	    pg_rd(pg_cc, CC_CX_GDSCR), pg_rd(pg_cc, CC_CX_GDS_HW_CTRL), pg_rd(pg_gcc, GCC_VOTE));
++	pg_step();
++}
++
++static void
++pg_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	int stage = 0, delay_s = 0, keep = 0;
++	(void)PE_parse_boot_argn("picassogpu", &stage, sizeof(stage));
++	(void)PE_parse_boot_argn("picassogpudelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("picassogpuslow", &pg_slow_ms, sizeof(pg_slow_ms));
++	(void)PE_parse_boot_argn("picassogpukeep", &keep, sizeof(keep));
++	if (pg_slow_ms > 10000) {
++		pg_slow_ms = 10000;
++	}
++	if (delay_s > 0 && delay_s <= 600) {
++		printf("PICASSO GPU: starting in %d s\n", delay_s);
++		pg_sleep_ms((unsigned)delay_s * 1000u);
++	}
++	printf("PICASSO GPU: stage %d (Adreno 620, GPU CC 0x%x, GMU 0x%x), %d ms after each step\n",
++	    stage, PG_GPUCC_PA, PG_GMU_PA, pg_slow_ms);
++	pg_gcc = ml_io_map(PG_GCC_PA, PG_GCC_SIZE);
++	pg_cc = ml_io_map(PG_GPUCC_PA, PG_GPUCC_SIZE);
++	if (pg_gcc == 0 || pg_cc == 0) {
++		printf("PICASSO GPU: clock controller map failed\n");
++		goto out;
++	}
++	pg_dump("as ABL left it");
++	if (stage < 2) {
++		goto out;
++	}
++	pg_gmu = ml_io_map(PG_GMU_PA, PG_GMU_SIZE);
++	if (pg_gmu == 0) {
++		printf("PICASSO GPU: GMU map failed\n");
++		goto out;
++	}
++	if (!pg_power_up_cx()) {
++		printf("PICASSO GPU: CX power-up failed; GMU registers not read\n");
++		pg_park();
++		goto out;
++	}
++	pg_dump("CX powered");
++	pg_gmu_reads();
++	if (keep) {
++		printf("PICASSO GPU: picassogpukeep=1: CX and the GMU clocks stay on (CM3 in reset)\n");
++	} else {
++		pg_park();
++	}
++	printf("PICASSO GPU: stage %d done\n", stage);
++out:
++	thread_terminate(current_thread());
++}
++
++void
++picasso_gpu_init(void)
++{
++	int stage = 0;
++	thread_t thread;
++	if (!PE_parse_boot_argn("picassogpu", &stage, sizeof(stage)) || stage <= 0) {
++		return;
++	}
++	if (kernel_thread_start(pg_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@ extern void picasso_touch_init(void);
+ extern void picasso_vib_init(void);
+ extern void picasso_backlight_init(void);
+ extern void picasso_cpufreq_init(void);
++extern void picasso_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -671,6 +672,8 @@ sweet_ufs_init(void)
+ 	picasso_backlight_init();
+ 	/* picasso：熄屏时 CPU 降到最低档（bsd/dev/picasso_cpufreq.c） */
+ 	picasso_cpufreq_init();
++	/* picasso：Adreno 620 的时钟/CX 域准备（boot-arg picassogpu=N，默认不碰；bsd/dev/picasso_gpu.c） */
++	picasso_gpu_init();
+ 	sweet_usb_probe();
+ 	return 0;
+ }

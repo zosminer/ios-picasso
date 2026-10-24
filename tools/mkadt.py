@@ -2,19 +2,18 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--lowmem]
   [--high-base=0x.. --high-size=0x..] [--touch-fw=DIR | --no-touch-fw]
+picasso 默认用真机验证过的高位内存段（0x140000000+3G）；--lowmem 回到旧的低位窗口，--qemu 也用低位。
 """
 import hashlib, os, struct, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import adt  # noqa: E402
 
-# Kernel-managed RAM: above every Qualcomm XPU carve-out (see NOTES.md)
-# picasso：原厂设备树（boot.img 的 Lito v2 + dtbo 的 7250 picasso）里位置固定的保留区，最高的是
-# disp_rdump_region 0xac000000-0xad000000，0xb0000000 以上没有任何固定保留区；所以沿用 sweet 的
-# 低位窗口 0xb0000000-0xfd000000（1.2 GiB）。前提是 0x80000000 起的第一段 DRAM 有 2 GiB，
-# 需用诊断 shim 打在屏幕上的 "DRAM banks" 核对。
+# 低位窗口（只有 --lowmem / --qemu 用）。**默认不用它**：另一台 K30 5G 的 shim 实测，第一段 DRAM
+# 到 0xBCC00000 就结束，0xBCC00000-0xC0000000 是空洞，而这个窗口 0xb0000000-0xfd000000 正好跨过它，
+# XNU 会把不存在的内存当 RAM 用 → 很可能死机。真机启动用下面 HIGH_* 的高位段。
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
 # Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
@@ -23,9 +22,7 @@ MEM_SIZE = 0x4d000000
 # and the kernel hangs right after "kdp_core zlib memory" — reproduced on QEMU
 # and independently on ios-fajita.
 PANIC_LOG_SIZE = 0x100000
-# --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
-# <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
-# carve-out is in the low bank and the dynamic pools are limited below 4G.
+# 默认的高位 DDR 段。every fixed reserved-memory carve-out is in the low bank.
 # picasso：用另一台 8 GB K30 5G 上**真机验证过**的窗口 0x1_40000000 起 3 GiB（到 0x2_00000000）：
 # github.com/minhtritt1996/ios-picasso 用它启动 XNU、挂载 iOS 根分区、跑到 SpringBoard；
 # 原厂设备树里位置固定的保留区都在 0xA2400000 以下。那台手机上 ABL 不给设备树，
@@ -119,7 +116,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, touch_fw_dir=TOUCH_FW_DIR):
+def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     touch_fw_dir：picasso 触控固件目录（None = 不放 /picasso-touch）。"""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -267,6 +264,10 @@ def build(seed=None, qemu=False, highmem=False, touch_fw_dir=TOUCH_FW_DIR):
     ])
 
     product_props = d22ap_product()
+    if product_props:
+        # ios-topaz 3eacb48 / 另一台 K30：iPhone X 的 /product 写的是 P3 广色域，但这块屏是 sRGB。
+        # 保留 P3 时 CoreAnimation/WebKit 会往 10 位色深的表面画（我们没有），结果图标/Safari 空白。
+        product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -304,7 +305,9 @@ if __name__ == '__main__':
             touch_dir = arg.split('=', 1)[1]
         elif arg == '--no-touch-fw':
             touch_dir = None
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw_dir=touch_dir)
+    # 默认高位内存段（真机验证过）；--lowmem 回到旧低位窗口，--qemu 也用低位。
+    highmem = '--lowmem' not in sys.argv and '--qemu' not in sys.argv
+    root = build(qemu='--qemu' in sys.argv, highmem=highmem, touch_fw_dir=touch_dir)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
