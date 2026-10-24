@@ -1,0 +1,213 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,21 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <security/mac_policy.h>
++#include <sys/sysctl.h>
++
++/*
++ * AMFI 的 sysctl 节点（设备上由 AMFI kext 建）：libamfi 的 amfi_developer_mode_status() 读
++ * security.mac.amfi.developer_mode_status（8 字节，1 = 开），ExtensionKit 读扩展缓存时要它。
++ * 没有这个节点就 "Unable to find AMFI"，LaunchServices 里没有扩展点，到处 PlugInKit -10814，
++ * 没有壁纸/小组件/文件扩展。（sapphire 0156 / ios-topaz 0150） */
++SYSCTL_DECL(_security_mac);
++SYSCTL_NODE(_security_mac, OID_AUTO, amfi, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "AMFI");
++static uint64_t sweet_amfi_developer_mode = 1;
++static uint64_t sweet_amfi_qa_root_certs = 0;
++SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, developer_mode_status, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_amfi_developer_mode, "developer mode (on: nothing is restricted here)");
++SYSCTL_QUAD(_security_mac_amfi, OID_AUTO, qa_root_certs_allowed, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &sweet_amfi_qa_root_certs, "");
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -305,8 +320,41 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * __mac_syscall("AMFI", ...)。dyld 问它能为启动的进程做什么（0x5a）：没有应答 dyld 会按受限方式跑、
++ * 忽略 DYLD_* 变量（ElleKit 的注入用它们）。参数是 { u64 flags 入, 指向 u64 flags 出的用户指针 }。
++ * libamfi 问的其它调用都成功、不动调用方的输出。没有这个名字的策略时 lsd 的 ExtensionKit 会说
++ * "Unable to find AMFI" 并且不注册任何 app 扩展（到处 PlugInKit -10814）。（sapphire 0156 / ios-topaz 0147/0109） */
++#define SWEET_AMFI_CHECK_DYLD_POLICY    0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t in_out[2] = { 0, 0 };
++	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++	int error;
++
++	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
++		static uint64_t seen;
++		if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {
++			seen |= 1ULL << call;
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			printf("SWEET AMFI: syscall %d from %s\n", call, name);
++		}
++		return 0;
++	}
++	error = copyin(arg, in_out, sizeof(in_out));
++	if (error == 0) {
++		error = copyout(&allow, (user_addr_t)in_out[1], sizeof(allow));
++	}
++	return error;
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +408,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",                     /* libamfi 和 dyld 按这个名字找它 */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFIService.cpp
+@@ -0,0 +1,105 @@
++/*
++ * SWEET：一个名为 AppleMobileFileIntegrity 的 IOService，和设备上 AMFI kext 发布的一样。
++ * ExtensionKit 读签名过的扩展缓存（/System/Library/xpc/extensions.plist，
++ * +[NSDictionary _EX_dictionaryWithSignedURL:error:]）之前，要先问 AMFI 的用户客户端这个签名的
++ * cdhash 在不在信任缓存里：IOServiceGetMatchingService("AppleMobileFileIntegrity")、IOServiceOpen type 0、
++ * IOConnectCallMethod selector 6 带一个标量和 cdhash。没有这个服务就 "Unable to find AMFI"、
++ * LaunchServices 里没有扩展点、到处 PlugInKit -10814（没有壁纸/小组件/文件扩展）。这个内核不校验任何
++ * 代码签名（sweet_amfi.c），所以每个 hash 都算可信：每次调用都成功。每个 selector 第一次记一条日志。
++ * （sapphire 0156，源自 HackiOS，APSL 2.0） */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class AppleMobileFileIntegrity : public IOService
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++public:
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrity::newUserClient(task_t owningTask, void *securityID __unused, UInt32 type __unused,
++    IOUserClient **handler)
++{
++	AppleMobileFileIntegrityUserClient *client = OSTypeAlloc(AppleMobileFileIntegrityUserClient);
++
++	if (client == NULL || !client->initWithTask(owningTask, NULL, 0) || !client->attach(this) || !client->start(this)) {
++		if (client != NULL) {
++			client->detach(this);
++			client->release();
++		}
++		return kIOReturnNoMemory;
++	}
++	*handler = client;
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch __unused, OSObject *target __unused, void *reference __unused)
++{
++	static uint64_t seen;
++
++	if (selector < 64 && !(seen & (1ULL << selector))) {
++		char name[32];
++		seen |= 1ULL << selector;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AMFI: user client selector %u from %s (%u scalars, %u bytes in): trusted\n", selector, name,
++		    args->scalarInputCount, args->structureInputSize);
++	}
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++extern "C" void
++sweet_amfi_service_init(void)
++{
++	static bool done;
++	AppleMobileFileIntegrity *amfi;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	amfi = OSTypeAlloc(AppleMobileFileIntegrity);
++	if (amfi == NULL || !amfi->init() || !amfi->attach(IOService::getServiceRoot())) {
++		IOLog("SWEET AMFI: no AppleMobileFileIntegrity service\n");
++		OSSafeReleaseNULL(amfi);
++		return;
++	}
++	amfi->registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity service published\n");
++}
++
++#else
++extern "C" void sweet_amfi_service_init(void) {}
++#endif
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void picasso_backlight_power(int on);        /* bsd/dev/picasso_backlight.c */
+ extern "C" void picasso_cpufreq_display(int on);       /* bsd/dev/picasso_cpufreq.c */
+ extern "C" int picasso_backlight_set(int level);         /* bsd/dev/picasso_backlight.c，0..4095 */
++extern "C" void sweet_amfi_service_init(void);           /* iokit/Kernel/arm/SweetAMFIService.cpp（sapphire 0156） */
+ /* picasso：qcom,mdss-dsi-panel-peak-brightness = 4200000（0.0001 nit）= 420 nit，对应 WLED 满量程 0xfff */
+ #define SWEET_FB_MAX_NITS               420
+ #define SWEET_FB_BL_MAX                 0xfff
+@@ -246,6 +247,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	/* iOS 把 AMFI 当成设备上的一个 IOService：ExtensionKit 要先问它 cdhash 在不在信任缓存里才会读扩展缓存
++	 * （否则没有壁纸/小组件/文件扩展）。这里全部放行（iokit/Kernel/arm/SweetAMFIService.cpp，sapphire 0156）。 */
++	sweet_amfi_service_init();
+ 	/* picasso：亮度（尼特，16.16 定点）由 CoreBrightness 写到 IOMFBBrightnessLevel，见 setProperties */
+ 	setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);
+ 	uint32_t blOn = 0;
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetAMFIService.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp

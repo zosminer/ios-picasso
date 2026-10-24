@@ -1,0 +1,160 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -212,6 +212,8 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_HIPRI_FORCERM    (1u << 11)
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+@@ -267,6 +269,10 @@ static struct {
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	/* 每个端点的传输（控制 0/1 和数据），总线复位时据此结束掉（sapphire 0159/0162） */
++	bool        xfer_active[EP_INT + 1];
++	uint8_t     xfer_rsc[EP_INT + 1];
++	uint32_t    resets;
+ } ud;
+ 
+ static inline void
+@@ -323,8 +329,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 	return -1;
+ }
+ 
+-/* One TRB (at DMA offset trb) on physical endpoint ep. */
+-static void
++/* 在物理端点 ep 上发一个 TRB（在 DMA 偏移 trb 处）：0 成功，-1 = 控制器拒绝。 */
++static int
+ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+ 	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
+@@ -339,20 +345,48 @@ ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) != 0) {
++		return -1;
++	}
++	if (ep <= EP_INT) {
++		/* 传输资源号，ENDTRANSFER 要用（Linux dwc3_gadget_ep_get_transfer_index） */
++		ud.xfer_rsc[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
++		ud.xfer_active[ep] = true;
++	}
++	return 0;
+ }
+ 
+-static void
++static int
+ ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
+ {
+-	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++	return ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++/* 结束端点 ep 上正在进行的传输（如果有）。 */
++static void
++ud_end_transfer(unsigned ep)
++{
++	if (ep <= EP_INT && ud.xfer_active[ep]) {
++		ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_HIPRI_FORCERM | ((uint32_t)ud.xfer_rsc[ep] << 16), 0, 0, 0);
++		delay(100);
++		ud.xfer_active[ep] = false;
++	}
+ }
+ 
++/* 把 ep0 挂到下一个 SETUP。控制器拒绝（主机放弃的控制传输还占着："ep0 cmd 0x6 status 1"）时
++ * 结束它再试，否则 ep0 再也不收 SETUP，之后每次枚举都在第一个 GET_DESCRIPTOR 失败（sapphire 0162）。 */
+ static void
+ ud_start_setup(void)
+ {
+ 	ud.state = EP0_SETUP;
+-	ud_start(0, UD_SETUP, 8, TRBCTL_SETUP);
++	if (ud_start(0, UD_SETUP, 8, TRBCTL_SETUP) != 0) {
++		ud.xfer_active[0] = true;
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		if (ud_start(0, UD_SETUP, 8, TRBCTL_SETUP) != 0) {
++			printf("SWEET USB: ep0 cannot be armed for SETUP\n");
++		}
++	}
+ }
+ 
+ static void
+@@ -588,7 +622,10 @@ ud_tx_kick_locked(void)
+ 		}
+ 		ud.tx_busy = true;
+ 		ud.tx_frames++;
+-		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++		if (ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL) != 0) {
++			ud.tx_busy = false;     /* 被拒：这一帧丢了，后面的不受影响 */
++			break;
++		}
+ 	}
+ }
+ 
+@@ -740,6 +777,39 @@ ud_if_create(void)
+ 	SweetUSBNetPublish("ue0", ud_phone_mac);
+ }
+ 
++/* 总线复位（主机的，或 usbipd 的）会丢掉控制器里数据端点的配置。以前只把地址清零，端点这边还当
++ * "已配置"，下一次 SET_CONFIGURATION 什么都没配、发送中的帧让 tx_busy 一直占着，于是 ue0 要重启才好。
++ * 照 Linux dwc3_gadget_reset_interrupt：结束数据端点传输、忘掉配置和队列、把卡在半截的控制传输
++ * 重新挂上（sapphire 0159/0162）。 */
++static void
++ud_bus_reset(void)
++{
++	for (unsigned ep = EP_RX; ep <= EP_INT; ep++) {
++		ud_end_transfer(ep);
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & ~((1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT)));
++	if (ud.lock != NULL) {
++		lck_mtx_lock(ud.lock);
++	}
++	ud.configured = false;
++	ud.data_alt = 0;
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	if (ud.lock != NULL) {
++		lck_mtx_unlock(ud.lock);
++	}
++	/* ep0：已经在等的 SETUP 留着；卡在半截的控制传输两个方向都结束掉再重新挂（Linux dwc3_ep0_end_control_data） */
++	if (ud.state != EP0_SETUP || !ud.xfer_active[0]) {
++		ud_end_transfer(0);
++		ud_end_transfer(1);
++		ud_start_setup();
++	}
++}
++
+ static void
+ ud_event(uint32_t ev)
+ {
+@@ -747,7 +817,10 @@ ud_event(uint32_t ev)
+ 		uint32_t type = (ev >> 8) & 0xf;
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+-			printf("SWEET USB: bus reset\n");
++			ud_bus_reset();
++			if (ud.resets++ < 20) {
++				printf("SWEET USB: bus reset\n");
++			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -765,6 +838,9 @@ ud_event(uint32_t ev)
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (ep <= EP_INT && type == 1) {
++		ud.xfer_active[ep] = false;
++	}
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;

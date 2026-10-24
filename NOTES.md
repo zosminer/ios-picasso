@@ -151,8 +151,29 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **补了 MIT LICENSE**（与上游 ios-sweet 067c9b3 一致）。
 - 验证：91 个补丁全部应用、应用后与草稿树逐字节一致；mkadt 默认输出 dram-base 0x140000000；
   picasso_usbphy.c SDK 语法检查无警告；validate-repo 通过。**仍未上机。**
-- 还没做（下批，均为通用、已确认值得移植）：sapphire 0159+0162（USB 总线复位后 ue0 恢复）、
-  0160（钥匙串写入）、0156（完整 AMFI）+clean-base 守护进程清单、0155（60 Hz）、0164（表面可换出）；
+### 从 sapphire 移植的通用修复（2026-10-24，补丁 0092-0095，离线完成，未上机）
+全部来自 ios-sapphire origin/sapphire（源自 HackiOS，改 XNU 的部分按 APSL 2.0），出处写在各补丁注释里。
+在我们打完补丁的草稿树上逐条适配（sapphire 的 hook 点有 topaz_modem_init/sapphire_gpu_init，我们没有，手工改放）：
+- **0092 USB 总线复位后恢复**（sapphire 0159+0162 合并）：`sweet_usb.c`。以前主机一重置 USB，ue0 就死到重启才好
+  （只清了地址，端点还当"已配置"）。现在照 Linux dwc3_gadget_reset_interrupt：结束各端点传输、忘掉配置和 TX 队列、
+  把卡在半截的控制传输重新挂上；端点命令跟踪资源号用于 ENDTRANSFER；ep0 被拒时结束残留再重挂（修 "ep0 cmd 0x6 status 1"）；
+  TX 被拒不再把 tx_busy 永久占住。
+- **0093 钥匙串能写入**（sapphire 0160）：`SweetKeyStore.cpp` 补上 aks_wrap_key(10)/aks_unwrap_key(11)。以前每次写钥匙串都
+  e00002c7 失败、Wi-Fi 密码存不住、设置 Wi-Fi 页卡几分钟。没有安全隔区也没密码，所以封装只是标记+固定 pad 异或（不保护任何东西，
+  仅为能读回）。
+- **0094 显示 60 Hz**（sapphire 0155 / ios-topaz 0948）：`SweetFramebuffer.cpp` 发布 TimingElements/ColorElements，选择子 79
+  块 0x40 返回当前模式。以前 CoreAnimation 按自己猜的刷新率跑（一秒 20 帧、50 ms 一帧），现在报 60 Hz，动画更顺。
+- **0095 完整 AMFI**（sapphire 0156 / ios-topaz 0147/0109/0150）：`sweet_amfi.c`（策略名改成 "AMFI"、加 __mac_syscall 的
+  dyld 策略查询 0x5a 全放行、加 security.mac.amfi.developer_mode_status=1 的 sysctl 节点）+ 新 `SweetAMFIService.cpp`
+  （发布 AppleMobileFileIntegrity 这个 IOService，用户客户端每个 selector 都放行）+ SweetFramebuffer 里调一次。
+  修好 lsd/ExtensionKit 找不到 AMFI、到处 PlugInKit -10814、没有壁纸/小组件/文件扩展。
+- **`tools/picasso-clean-base.sh`**（sapphire tools/sapphire-clean-base.sh）：0095 之后系统能看到扩展，那些需要本机没有的东西
+  （Metal/基带/蓝牙/语音/安全隔区）的扩展会崩溃死循环，开机两三分钟卡死。这个脚本（手机上 root 跑，可 undo）把它们和几个
+  占核的守护进程（wifip2pd/assetsd/coreduetd/aggregated/dasd）关掉。**0095 一定要配它用**，否则进了桌面也会卡死。
+  路径按 Procursus rootless /var/jb（我们的越狱环境未定，上机前按实际改路径）。
+- 验证：check-patch-series 本仓库 95 个补丁全部应用、与草稿树逐字节一致；sweet_usb.c 无新增 C 错误；clean-base `sh -n` 通过；
+  validate-repo 通过。IOKit 的 .cpp 无法用 SDK 头单独语法检查（要 XNU 源码树），靠补丁能干净套用 + 与 sapphire 原补丁基本一致来保证。**仍未上机。**
+- 还剩（更大/更靠后）：sapphire 0164（IOSurface 可换出，防越用越卡；依赖我们没有的 scanoutPhys，要手工改）；
   GPU 照 HackiOS redwood_adreno.c（APSL 2.0，同类 a6xx+GMU，寄存器地址与我们原厂设备树一致）移植到 0091 之上。
 
 ### GitHub 新进展核对（2026-10-24）
