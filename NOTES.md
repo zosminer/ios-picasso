@@ -177,6 +177,17 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **🎉 用户观测：进 iOS，明显比 k4 流畅，触摸能用**（0082 Novatek 触屏驱动在真机上工作，固件选择默认 fw01 就对）。
 - 读日志：官方 OrangeFox R11.3_3 picasso（zip md5 b4421474…、recovery.img md5 dd55416b…，与官网一致）放在 `recovery/`（不入库）；
   `fastboot boot recovery/recovery.img` → `tools/sweet-log-pull.sh OUT.txt`（已把 Linux 的 `stat -c` 改成 `wc -c`，Mac 上能跑）。
+- **k5 日志**（`logs/boot-k5.txt`，不入库，5845 行）已观测：8/8 CPU；电量计读到 3596 mV、5%（MIUI 关机前显示 64%，**待查**换算或采样点）；
+  振动 ready 3000 mV；背光 WLED5 ready 1023/4095；触屏芯片 ID 0c 00 00 72 66 03、面板 37_02_0b → fw02、下载成功；
+  UFS userdata LUN0 109611 MiB；**CPU 调频 bug**：cpu6/cpu7 单核域"最高非加速档"判成第 0 档，大核一直 652/806 MHz；
+  **音量上键 bug**：读的是 GPIO6（0xc500），原厂设备树是 GPIO5（0xc400，pins="gpio5"），而且 ABL 没打开它；
+  日志刷屏：SWEET AKS 2402 行（SpringBoard sel 17 就 816 次）、SWEET KEYS read error 155 行；
+  反复重启：xpcproxy 389、fairplayd.H2 81、bluetoothd 80、三个语音合成扩展各 12 次（各崩 36 次）、assetsd 崩溃循环、driverkitd 被杀。
+- **0097**（CI run 41192830561）：大核按表里最大核心数判断最高档（2208/2400 MHz）；音量上键改 GPIO5，未打开时按原厂
+  key_vol_up_default 配（输入、上拉、打开，sweet_spmi_write 白名单只加这 4 个寄存器）；AKS 每个选择子只记前 4 次；
+  没有音量上键时不再报读错误。`sweet-root-tweaks.py` 新增 cleanbase：删 9 个 launchd 任务、挪走 16 个扩展和 BTAudioHALPlugin。
+  新镜像 sha256 7f87a3e2…，已重写 userdata（305 s）；之后 `fastboot boot` 卡在 Sending（大写入后 ABL 卡住，同另一台 K30 的经验），
+  要用户手动重进 fastboot。k6 = k5 + `picassogpu=1 picassogpudelay=40`（GPU 时钟树只读报告），sha256 54eaf495…。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
