@@ -1,0 +1,176 @@
+--- a/bsd/dev/picasso_cpufreq.c
++++ b/bsd/dev/picasso_cpufreq.c
+@@ -109,7 +109,8 @@ picasso_cpufreq_init(void)
+ 			printf("PICASSO CPUFREQ: %s hardware DCVS not enabled; off\n", pc_dom[d].name);
+ 			return;
+ 		}
+-		unsigned prev = 0, n = 0, top = 0;
++		unsigned prev = 0, n = 0, top = 0, maxcc = 0;
++		unsigned cc_of[PC_MAX_ROWS];
+ 		for (unsigned i = 0; i < PC_MAX_ROWS; ++i) {
+ 			uint32_t v = pc_rd(pc.va[d], PC_FREQ_LUT + i * PC_ROW);
+ 			unsigned src = v >> 30, lval = v & 0xffu, cc = (v >> 16) & 7u;
+@@ -118,12 +119,23 @@ picasso_cpufreq_init(void)
+ 				break;          /* 表结束 */
+ 			}
+ 			pc.khz[d][i] = khz;
+-			if (cc == pc_dom[d].cores) {
+-				top = i;        /* 加速档的核心数比该域少 */
++			cc_of[i] = cc;
++			if (cc > maxcc) {
++				maxcc = cc;
+ 			}
+ 			prev = khz;
+ 			n = i + 1;
+ 		}
++		/*
++		 * 加速档（boost）的核心数比正常档少（Linux qcom-cpufreq-hw：core_count != max_cores）。
++		 * 真机日志：单核的 cpu6/cpu7 域里表项的核心数字段不等于 1，原来按"等于该域核心数"判断，
++		 * 结果最高档选成了第 0 档，大核一直在 652/806 MHz（应为 2208/2400）。改成以表里最大的核心数为准。
++		 */
++		for (unsigned i = 0; i < n; ++i) {
++			if (cc_of[i] == maxcc) {
++				top = i;
++			}
++		}
+ 		uint32_t cur = pc_rd(pc.va[d], PC_PERF_STATE);
+ 		pc.rows[d] = n;
+ 		pc.top[d] = top;
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,8 +1,8 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+- * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
++ * PMIC access is read only, except picasso: if ABL left the volume-up GPIO
++ * disabled it is configured once as in the stock device tree (sweet_spmi_write).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -12,6 +12,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -21,7 +22,11 @@ void sweet_keys_init(void);
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc510u
++/* picasso：原厂设备树 gpio_keys volume_up = <&pm8150l_gpios 5>，pinctrl pins = "gpio5"，即 PM8150L（SID 4）
++ * GPIO5 = 0xc400、PPID 0x4c4。以前按 GPIO6（0xc500）读，真机上 mode/en 全 0、音量上一直读不到（logs/boot-k5.txt）。 */
++#define KEYS_GPIO_BASE   0xc400u
++#define KEYS_GPIO_PPID   0x4c4u
++#define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+@@ -100,7 +105,10 @@ keys_thread(void *arg, wait_result_t result)
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		bool gok = keys_gpio_apid == KEYS_NO_APID || keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		if (keys_gpio_apid == KEYS_NO_APID) {
++			gpio = 1;      /* 没有音量上键：当作一直松开 */
++		}
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -113,7 +121,7 @@ keys_thread(void *arg, wait_result_t result)
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio6:c510=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio5:c410=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -152,21 +160,38 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c5, count);
++	keys_gpio_apid = keys_find_apid(KEYS_GPIO_PPID, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc540, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc546, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc505, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio6-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x40u, &mode);
++	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x46u, &en);
++	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio5-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++	/* picasso：脚没打开时按原厂设备树配一次（下面），其余只诊断。 */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
++	if (eok && mok && sok && !(en & 0x80u) && sweet_spmi_init() == 0) {
++		/*
++		 * picasso：Android 的 pinctrl 才配这个脚，ABL 不配。照原厂设备树 key_vol_up_default：
++		 * 输入（MODE_CTL 0）、power-source 0（DIG_VIN_CTL 0）、bias-pull-up（DIG_PULL_CTL 0 = 30 uA 上拉）、
++		 * 打开（EN_CTL 位 7）。sweet_spmi_write 只放行这四个寄存器，且只写归应用处理器（EE 0）的 APID。
++		 */
++		static const uint8_t cfg[4][2] = { { 0x40, 0x00 }, { 0x41, 0x00 }, { 0x42, 0x00 }, { 0x46, 0x80 } };
++		int werr = 0;
++		for (unsigned i = 0; i < 4; ++i) {
++			werr |= sweet_spmi_write(4, KEYS_GPIO_BASE + cfg[i][0], &cfg[i][1], 1);
++		}
++		mok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x40u, &mode);
++		eok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x46u, &en);
++		dir = subtype >= 0x10u && subtype <= 0x13u ? mode & 3u : (mode >> 4) & 7u;
++		printf("SWEET KEYS: GPIO5 configured as input with pull-up (write %s): mode=%#x en=%#x\n",
++		    werr ? "FAILED" : "ok", mode, en);
++	}
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO6 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO5 not confirmed enabled as input; volume-up withheld\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -200,6 +200,10 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 	if (sid == SP_WLED_SID && per == SP_WLED_SINK) {
+ 		return off == 0x53 || off == 0x63 || ((off == 0x54 || off == 0x64 || off == 0x65) && len == 1);
+ 	}
++	if (sid == 4 && per == 0xc4) {
++		/* picasso：PM8150L GPIO5（音量上键）的 MODE_CTL/DIG_VIN_CTL/DIG_PULL_CTL/EN_CTL（sweet_keys.c） */
++		return len == 1 && (off == 0x40 || off == 0x41 || off == 0x42 || off == 0x46);
++	}
+ 	return false;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -336,10 +336,17 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	/* picasso：真机上一次开机打了 2400 多行（SpringBoard 一个就 816 次 sel 17），只记每个选择子的头几次和所有失败 */
++	static uint8_t logged[128];
++	if (ret != kIOReturnSuccess || selector >= 128 || logged[selector] < 4) {
++		if (selector < 128 && logged[selector] < 255) {
++			logged[selector]++;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */

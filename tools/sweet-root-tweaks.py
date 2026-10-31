@@ -164,11 +164,78 @@ def network(root):
     print('network: USB Ethernet ue0 192.168.7.2/24 via 192.168.7.1')
 
 
+# picasso（2026-10-31 真机日志 logs/boot-k5.txt）：这些反复崩溃或没完没了重启，唤醒 ReportCrash/launchd、
+# 抢 CPU，系统因此更卡：bluetoothd 80 次、fairplayd.H2 81 次、三个语音合成扩展各 12 次（各崩 36 次）、
+# assetsd 崩溃循环、driverkitd 被杀。另外照 ios-sapphire tools/sapphire-clean-base.sh 和它 2026-10-23 的
+# NOTES：wifip2pd（没有 AWDL）、coreduetd/aggregated/dasd（时钟从 1970 跳到 2026 后各占满一个核）、
+# vmd（等基带）、BTAudioHALPlugin（mediaserverd 每秒约 110 次重连 bluetoothd，让 launchd 空转）。
+# 在镜像里离线做：从 launchd.plist 删掉这些任务、把扩展和 HAL 插件挪到 *.disabled，等硬件能用了再挪回来。
+CLEAN_JOBS = ('com.apple.bluetoothd', 'com.apple.fairplayd.H2', 'com.apple.wifip2pd', 'com.apple.assetsd',
+              'com.apple.coreduetd', 'com.apple.aggregated', 'com.apple.dasd', 'com.apple.voicemail.vmd',
+              'com.apple.driverkitd')
+CLEAN_EXTENSIONS = (
+    'System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex',
+    'System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex',
+    'System/Library/PrivateFrameworks/MacinTalk.framework/PlugIns/MacinTalkAUSP.appex',
+    'System/Library/PrivateFrameworks/SiriTTSService.framework/PlugIns/SiriTTSSynthesizerAU.appex',
+    'System/Library/PrivateFrameworks/TextToSpeechKonaSupport.framework/PlugIns/KonaSynthesizer.appex',
+    'System/Library/PrivateFrameworks/MobileTimer.framework/PlugIns/MobileTimerIntents.appex',
+    'System/Library/PrivateFrameworks/CalendarWidget.framework/PlugIns/IntentsExtension.appex',
+    'Applications/Music.app/PlugIns/MusicWidgets.appex',
+    'Applications/Home.app/PlugIns/HomeWidget.appex',
+    'Applications/Home.app/PlugIns/HomeWidgetSingleAccessoryIntent.appex',
+    'Applications/Books.app/PlugIns/BooksWidgetExtension.appex',
+    'Applications/Weather.app/PlugIns/WeatherWidget.appex',
+    'Applications/AppleTV.app/PlugIns/TVWidgetExtension.appex',
+    'Applications/Stocks.app/PlugIns/StocksDetailIntents.appex',
+    'Applications/Passbook.app/PlugIns/PassbookWidgetsExtension-iPhone.appex',
+    'Applications/AppStore.app/PlugIns/AppStoreWidgetsExtension.appex',
+    'System/Library/AppPlaceholders/Music.app/PlugIns/MusicWidgets.appex',
+    'System/Library/AppPlaceholders/Home.app/PlugIns/HomeWidget.appex',
+    'System/Library/AppPlaceholders/Home.app/PlugIns/HomeWidgetSingleAccessoryIntent.appex',
+    'System/Library/AppPlaceholders/Books.app/PlugIns/BooksWidgetExtension.appex',
+    'System/Library/AppPlaceholders/Weather.app/PlugIns/WeatherWidget.appex',
+    'System/Library/AppPlaceholders/AppleTV.app/PlugIns/TVWidgetExtension.appex',
+    'System/Library/AppPlaceholders/Stocks.app/PlugIns/StocksDetailIntents.appex',
+    'System/Library/AppPlaceholders/Passbook.app/PlugIns/PassbookWidgetsExtension-iPhone.appex',
+)
+
+
+def cleanbase(root):
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    jobs = plist['LaunchDaemons']
+    removed = [k for k, j in jobs.items() if j.get('Label') in CLEAN_JOBS]
+    for k in removed:
+        del jobs[k]
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print(f'clean base: {len(removed)} launchd jobs removed')
+    store = os.path.join(root, 'private/var/mobile/disabled-extensions')
+    moved = 0
+    for rel in CLEAN_EXTENSIONS:
+        src = os.path.join(root, rel)
+        if not os.path.isdir(src):
+            continue
+        dst = os.path.join(store, rel)      # 原路径保留在 store 里，挪回去时一目了然
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        moved += 1
+    print(f'clean base: {moved} crash-looping extensions moved to /private/var/mobile/disabled-extensions')
+    hal = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')
+    if os.path.exists(hal):
+        dst_dir = os.path.join(root, 'System/Library/Audio/Plug-Ins/HAL.disabled')
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.move(hal, dst_dir)
+        print('BTAudioHALPlugin.driver disabled')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
     root = sys.argv[1]
     launchd(root)
+    cleanbase(root)
     containers(root)
     activation(root)
     audio(root)
