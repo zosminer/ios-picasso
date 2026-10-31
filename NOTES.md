@@ -188,6 +188,17 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   没有音量上键时不再报读错误。`sweet-root-tweaks.py` 新增 cleanbase：删 9 个 launchd 任务、挪走 16 个扩展和 BTAudioHALPlugin。
   新镜像 sha256 7f87a3e2…，已重写 userdata（305 s）；之后 `fastboot boot` 卡在 Sending（大写入后 ABL 卡住，同另一台 K30 的经验），
   要用户手动重进 fastboot。k6 = k5 + `picassogpu=1 picassogpudelay=40`（GPU 时钟树只读报告），sha256 54eaf495…。
+- **k6 第一次启动（新刷的镜像）停在苹果 logo 超过 5 分钟**（用户观测）。日志 `logs/boot-k6.txt`（1652 行，含二进制，用 `grep -a`）已观测：
+  GPU 第 1 步时钟树报告正常（cx/gx gdscr 0x00222001，gcc 投票 0x52000=0x01207c7f）；音量上 GPIO5 读到 0x1（松开）、按键事件正常；
+  触屏事件正常。**`exec lsd` 一次都没有**（k5 里 lsd 在 coreduetd 之后启动）。SpringBoard t0 卡在
+  `_LSContextInitCommon` 的 os_unfair_lock，t1 和 backboardd t10 都卡在
+  `___LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__` → `_LSCopyServerStore` 对 lsd 的同步 XPC
+  （符号化：`ipsw dyld a2s research/dsc/dyld_shared_cache_arm64 --slide 0x1c7a8000 ADDR`）。
+  xpcproxy 与守护进程 exec 数一一对应（178/179），说明不是 xpcproxy 卡住，而是 launchd 没为 lsd 发起启动；launchd 没打印错误。
+  镜像里 com.apple.lsd 任务本身完好（MachServices 含 com.apple.lsd.mapdb）。
+  **k6 是新镜像的第一次启动**（usermanagerd：`diskLoadUserSessions failed / NO USER SESSIONS / Creating New Primary Session`），
+  k5 是旧镜像的第二次启动（k4 是第一次，也出现过两三次苹果 logo、很久才进界面）。推测：首次启动问题，或 cleanbase 删掉的任务（coreduetd 等）
+  在 k5 里间接拉起了 lsd。验证：从 OrangeFox `adb reboot bootloader`（不用按键）后再次 `fastboot boot shim-boot-k6.img`（第二次启动），已执行。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
