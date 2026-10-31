@@ -172,8 +172,11 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `SWEET KEYS: read error pon-ok=1 gpio-ok=0 arb-status=0x1`（音量上 GPIO6 读不到，电源/音量下正常；待查）。
   卡的原因（推测）：cpus=1 只开 1 个核；serial=3 + kprintf_spam 把每条日志画到屏幕上；sweetfb_hz 默认 10 帧；
   CPU 频率保持 ABL 留下的档位。
-- **k5**（sha256 见下）= 去掉 serial=3/-enable_kprintf_spam，`cpus=8 sweetfb_noconsole=1 sweetfb_hz=30 picassocpufreq=2`
+- **k5**（sha256 3c880709…）= 去掉 serial=3/-enable_kprintf_spam，`cpus=8 sweetfb_noconsole=1 sweetfb_hz=30 picassocpufreq=2`
   （另一台 K30 上 cpus=8 可用；cpufreq=2 亮屏用最高非加速档）。
+  **🎉 用户观测：进 iOS，明显比 k4 流畅，触摸能用**（0082 Novatek 触屏驱动在真机上工作，固件选择默认 fw01 就对）。
+- 读日志：官方 OrangeFox R11.3_3 picasso（zip md5 b4421474…、recovery.img md5 dd55416b…，与官网一致）放在 `recovery/`（不入库）；
+  `fastboot boot recovery/recovery.img` → `tools/sweet-log-pull.sh OUT.txt`（已把 Linux 的 `stat -c` 改成 `wc -c`，Mac 上能跑）。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
