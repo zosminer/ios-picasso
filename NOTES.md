@@ -202,6 +202,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **k6 第二次启动进了 iOS 界面**（用户观测，"开机慢"）：音量加、音量减、电源键都正常（0097 的 GPIO5 修复在真机上有效）。
   所以 k6 第一次卡住是首次启动的问题，不是 cleanbase 删多了（这点是推测，第二次启动的日志还没拉）。
   用户感觉"可能还是没有 gpu 驱动"：对，目前全部是 CPU 软件绘制，picassogpu=1 只读时钟树。
+- **k6 第二次启动日志** `logs/boot-k6b.txt`（2991 行）已观测：lsd 正常启动；电量计从 SDAM 起算 62%→65%，**与用户看到的 65% 一致**
+  （k5 的 5% 那次 SDAM 无效、走 OCV 曲线、读到 3596 mV 放电 383 mA；k6 首次启动 SDAM soc=9 被拒、OCV 算 66.75%）。
+  但中间有几次 `static fallback, 100% 4200mV`（一次读失败就发布 100%）→ **0098**：已有好样本时保留上次值，连续 10 次失败才回到固定值。
+  崩溃：只有 4 个小组件扩展首次启动 check-in 超时被杀（ScreenTimeWidget、PeopleWidget、LockScreenPeople、GCWidgets），
+  没有守护进程崩溃循环。nanotimekitcompaniond 被 LaunchServices.ApplicationsChanged 拉起 42 次 → 加进 cleanbase（下次做镜像才生效）。
+- **k7**（sha256 37bc09a8…）= k6 + `picassogpu=2 picassogpudelay=60 picassogpuslow=1200`，0097 内核不变：测 0091 第 2 步
+  （开 CX GDSC 和 GMU 时钟、CM3 按在复位、读 GMU 寄存器和常开计数器，然后恢复）。已从 OrangeFox `adb reboot bootloader` 后 fastboot boot。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：

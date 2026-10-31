@@ -1,0 +1,37 @@
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -39,6 +39,7 @@ private:
+ 	int fLastMode;
+ 	struct pg_state fGauge;         /* picasso */
+ 	uint64_t fLastSample;           /* mach_absolute_time of the last gauge update */
++	unsigned fFailCount;            /* picasso：连续读失败次数 */
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -64,6 +65,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fTimerAdded = fRunning = fReal = false;
+ 	bzero(&fGauge, sizeof(fGauge));
+ 	fLastSample = 0;
++	fFailCount = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -214,9 +216,18 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
++		/* picasso（logs/boot-k6b.txt）：偶尔一次读失败就报 100%，界面电量在 65% 和 100% 之间跳。
++		 * 已经有过好样本时保留上次发布的数值，连续 10 次（5 分钟）都读不到才回到固定值。 */
++		if (fGauge.started && ++fFailCount < 10) {
++			if (fFailCount == 1) {
++				IOLog("SWEET BATTERY: sample failed, keeping last value\n");
++			}
++			return;
++		}
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 		return;
+ 	}
++	fFailCount = 0;
+ 	bool external = (usb & 0x10u) != 0;
+ 	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
+ 	unsigned state = charger & 7u;

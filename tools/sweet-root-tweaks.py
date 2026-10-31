@@ -172,7 +172,10 @@ def network(root):
 # 在镜像里离线做：从 launchd.plist 删掉这些任务、把扩展和 HAL 插件挪到 *.disabled，等硬件能用了再挪回来。
 CLEAN_JOBS = ('com.apple.bluetoothd', 'com.apple.fairplayd.H2', 'com.apple.wifip2pd', 'com.apple.assetsd',
               'com.apple.coreduetd', 'com.apple.aggregated', 'com.apple.dasd', 'com.apple.voicemail.vmd',
-              'com.apple.driverkitd')
+              'com.apple.driverkitd',
+              # logs/boot-k6b.txt：每次 LaunchServices.ApplicationsChanged 都被拉起，4 分钟 42 次；
+              # 它只给 Apple Watch 表盘做快照，没有手表用不上
+              'com.apple.nanotimekitcompaniond')
 CLEAN_EXTENSIONS = (
     'System/Library/CoreServices/AegirProxyApp.app/PlugIns/AegirPoster.appex',
     'System/Library/PrivateFrameworks/EmojiPoster.framework/PlugIns/EmojiPosterExtension.appex',
