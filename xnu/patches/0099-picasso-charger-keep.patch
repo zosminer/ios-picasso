@@ -1,0 +1,157 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -200,6 +200,11 @@ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ 	if (sid == SP_WLED_SID && per == SP_WLED_SINK) {
+ 		return off == 0x53 || off == 0x63 || ((off == 0x54 || off == 0x64 || off == 0x65) && len == 1);
+ 	}
++	if (sid == 2 && len == 1) {
++		/* picasso：PM7250B 充电器（smb5-reg.h）。只放行三个命令寄存器，见 SweetBattery.cpp chargerKeep()：
++		 * MISC 0x1643 BARK_BITE_WDOG_PET、CHGR 0x1042 CHARGING_ENABLE_CMD、USBIN 0x1340 USBIN_CMD_IL（输入挂起位）。 */
++		return (per == 0x16 && off == 0x43) || (per == 0x10 && off == 0x42) || (per == 0x13 && off == 0x40);
++	}
+ 	if (sid == 4 && per == 0xc4) {
+ 		/* picasso：PM8150L GPIO5（音量上键）的 MODE_CTL/DIG_VIN_CTL/DIG_PULL_CTL/EN_CTL（sweet_keys.c） */
+ 		return len == 1 && (off == 0x40 || off == 0x41 || off == 0x42 || off == 0x46);
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -18,6 +18,7 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
+ extern "C" uint64_t mach_absolute_time(void);
+ extern "C" void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);
+ /* picasso：电量计算法（纯函数，tools/picasso-gauge-test.c 测过） */
+@@ -40,6 +41,12 @@ private:
+ 	struct pg_state fGauge;         /* picasso */
+ 	uint64_t fLastSample;           /* mach_absolute_time of the last gauge update */
+ 	unsigned fFailCount;            /* picasso：连续读失败次数 */
++	int fCharge;                    /* picasso：boot-arg picassocharge，默认 1 */
++	unsigned fTick;                 /* picasso：8 s 定时器计数，每 4 次读一次电量 */
++	uint8_t fChgLast[20];           /* picasso：上次记下的充电器寄存器 */
++	bool fChgLogged;
++	unsigned fChgLines;
++	void chargerKeep(void);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -66,6 +73,11 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	bzero(&fGauge, sizeof(fGauge));
+ 	fLastSample = 0;
+ 	fFailCount = 0;
++	fCharge = 1;
++	fTick = 0;
++	bzero(fChgLast, sizeof(fChgLast));
++	fChgLogged = false;
++	fChgLines = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -276,13 +288,85 @@ SweetBattery::poll(void)
+ 	    charging, full, true, currentValid);
+ }
+ 
++/*
++ * picasso（logs/boot-k7.txt，2026-10-31 夜）：插着电脑 USB，整夜 external=1 charging=0、电流 -515 mA 起，
++ * 电池放到 3004 mV 关机。OrangeFox（Linux qpnp-smb5）下同一根线 Charging，-752 mA。
++ * Linux smb5_init_hw 把充电器看门狗配成"插入时启动、bark 16 s（dt qcom,wd-bark-time-secs）、
++ * 再 8 s bite、bite 时停止充电"（SNARL_BARK_BITE_WD_CFG 位 7 BITE_WDOG_DISABLE_CHARGING_CFG），
++ * 只在 bark 中断里喂狗。从 Linux 重启进我们的内核后没人喂狗 → 推测就是这个停了充电（待本函数的日志证实）。
++ * picassocharge=1（默认）：每 8 s 喂一次狗（写 MISC 0x1643 = 1，同 Linux wdog_bark_irq_handler）；
++ *   充电命令位（CHGR 0x1042 位 0）被清了就置回 1，USB 输入挂起位（USBIN 0x1340 位 0）被置了就清掉
++ *   （Linux 不挂起、不禁止充电时也是这两个值）。电流、电压、温度保护全部保持原样，由充电器硬件管。
++ * picassocharge=0：只记录不写。
++ * 寄存器变化时打一行（最多 60 行）：寄存器名和偏移照 smb5-reg.h。
++ */
++static const struct {
++	uint16_t addr;
++	const char *name;
++} kChgRegs[] = {
++	{ 0x1006, "chg_st1" }, { 0x1007, "chg_st2" }, { 0x100b, "chg_st5" }, { 0x100d, "chg_st7" },
++	{ 0x1042, "chg_en_cmd" }, { 0x1043, "pause_cmd" }, { 0x1051, "chgr_cfg2" },
++	{ 0x1061, "fcc_cfg" }, { 0x1070, "fv_cfg" },
++	{ 0x1107, "icl_st" }, { 0x1108, "aicl_icl_st" }, { 0x110b, "pwr_path" },
++	{ 0x1307, "apsd_st" }, { 0x1308, "apsd_result" }, { 0x1340, "usbin_suspend" },
++	{ 0x1366, "icl_opts" }, { 0x1370, "icl_cfg" },
++	{ 0x1606, "temp_range" }, { 0x1651, "wd_cfg" }, { 0x1653, "wd_bark_bite" },
++};
++
++void
++SweetBattery::chargerKeep(void)
++{
++	uint8_t now[sizeof(kChgRegs) / sizeof(kChgRegs[0])];
++	bool ok = true;
++	for (unsigned i = 0; i < sizeof(now); ++i) {
++		if (sweet_spmi_read(2, kChgRegs[i].addr, &now[i])) {
++			now[i] = 0xff;
++			ok = false;
++		}
++	}
++	if ((!fChgLogged || memcmp(now, fChgLast, sizeof(now))) && fChgLines < 60) {
++		char line[512];
++		int n = snprintf(line, sizeof(line), "SWEET CHARGER:%s", ok ? "" : " (some reads failed)");
++		for (unsigned i = 0; i < sizeof(now) && n > 0 && (unsigned)n < sizeof(line); ++i) {
++			n += snprintf(line + n, sizeof(line) - (unsigned)n, " %s=%02x", kChgRegs[i].name, now[i]);
++		}
++		IOLog("%s\n", line);
++		memcpy(fChgLast, now, sizeof(now));
++		fChgLogged = true;
++		++fChgLines;
++	}
++	if (fCharge < 1 || !ok) {
++		return;
++	}
++	static const uint8_t one = 1;
++	int err = sweet_spmi_write(2, 0x1643, &one, 1);         /* BARK_BITE_WDOG_PET */
++	if (err && fChgLines < 60) {
++		IOLog("SWEET CHARGER: watchdog pet refused\n");
++		++fChgLines;
++	}
++	if (!(now[4] & 1u)) {                                   /* CHARGING_ENABLE_CMD 位 0 */
++		uint8_t v = (uint8_t)(now[4] | 1u);
++		err = sweet_spmi_write(2, 0x1042, &v, 1);
++		IOLog("SWEET CHARGER: charging enable command was off; set (%d)\n", err);
++	}
++	if (now[14] & 1u) {                                     /* USBIN_CMD_IL 位 0 = 输入挂起 */
++		uint8_t v = (uint8_t)(now[14] & ~1u);
++		err = sweet_spmi_write(2, 0x1340, &v, 1);
++		IOLog("SWEET CHARGER: USB input was suspended; resumed (%d)\n", err);
++	}
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+-		self->poll();
+-		sender->setTimeoutMS(30000);
++		/* picasso：8 s 一次喂充电器看门狗（bark 16 s），电量照旧约 30 s 读一次 */
++		self->chargerKeep();
++		if (++self->fTick % 4 == 0) {
++			self->poll();
++		}
++		sender->setTimeoutMS(8000);
+ 	}
+ }
+ 
+@@ -295,6 +379,10 @@ SweetBattery::start(IOService *provider)
+ 	int real = 1;	/* picasso：默认读 PM7250B；sweetbattery=0 回到固定 100% */
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
++	(void)PE_parse_boot_argn("picassocharge", &fCharge, sizeof(fCharge));
++	if (fReal) {
++		chargerKeep();  /* picasso：先记下 ABL/上一个系统留下的充电器状态，再开始喂狗 */
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -303,7 +391,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(8000);
+ 		} else {
+ 			fReal = false;
+ 			poll();

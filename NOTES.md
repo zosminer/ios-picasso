@@ -213,6 +213,19 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - 0098 CI run 41203188095 成功（只跳过 4 个 dxb 补丁，内核里有 "sample failed, keeping last value"），产物在 `xnu/out-0098/`。
   **k8**（sha256 a472b6ef…）= 0098 内核 + k7 的命令行。计划：用户进 fastboot → 先进 OrangeFox 拉 k7 日志
   （如果 GPU 第 2 步把手机弄死，日志会停在那里；如果没事，跑一夜环形日志可能已经覆盖掉）→ 再 fastboot boot k8。
+- **k7 日志** `logs/boot-k7.txt`（5589 行，409 KB，flush #925）已观测：
+  - **GPU 第 2 步在真机上全部成功**：GPLL0/GPLL0_DIV 投票、gcc 三路总线时钟 running、**CX GDSC PWR_ON**（gdscr 0xf8222000，
+    hw_ctrl 0x80001fe0）、gpucc cxo/ahb running、GMU RCG 200 MHz（cfg 0x602）updated、cx_gmu running、SMMU 投票 running；
+    GMU 寄存器可读（CM3_SYSRESET 1、CM3_CFG 0x4052、SPTPRAC 0xc0 = GX GDSC 关/GX 时钟关、RPMH_POWER_STATE 0xf、
+    AO_GPU_CX_BUSY 0x30000000）；**常开计数器 10 ms 涨 211441**（19.2 MHz，睡眠多睡了约 1 ms）；之后恢复到 ABL 状态，系统继续正常运行。
+    下一步是 GMU 固件（HackiOS 的 step 7-16：RSCC、SMMU、GMU 内存、固件、CM3 启动、HFI）。
+  - **整夜没充电，电池放空关机**：开机第一样本就是 `3722mV -515mA external=1 charging=0`（插着电脑）；电压一路降到 3004 mV。
+    最后一次 display on 之后屏幕一直没灭（3308 行起），大核一直 2.4 GHz。电量计 35% 直接跳 1%（大电流下 OCV 曲线偏低，待修）。
+    早上 OrangeFox 里 `capacity 6 / voltage 4065577 / Charging / current_now -752258 / usb online 1`：同一根线 Linux 下在充。
+    推测原因：Linux qpnp-smb5 把充电器看门狗配成插入时启动、bite 时停充，我们的内核不喂狗。
+  - mediaserverd 崩了 2 次（sig 6），未查。
+- **0099**：SweetBattery 每 8 s 喂 smb5 看门狗（MISC 0x1643=1），充电命令位被清就置回、USB 输入挂起就清掉；
+  充电器 20 个寄存器变化时打 `SWEET CHARGER:` 一行（最多 60 行）；`picassocharge=0` 只记录。sweet_spmi 写白名单只加这 3 个寄存器。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
