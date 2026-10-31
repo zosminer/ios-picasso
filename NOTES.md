@@ -226,6 +226,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   - mediaserverd 崩了 2 次（sig 6），未查。
 - **0099**：SweetBattery 每 8 s 喂 smb5 看门狗（MISC 0x1643=1），充电命令位被清就置回、USB 输入挂起就清掉；
   充电器 20 个寄存器变化时打 `SWEET CHARGER:` 一行（最多 60 行）；`picassocharge=0` 只记录。sweet_spmi 写白名单只加这 3 个寄存器。
+- **CI 换 runner（必须）**：macos-14 镜像 2026-11-02 退役，10-31 14:00 UTC 起有 brownout（0099 的 push 构建 41253702678 因此 0 s 失败）。
+  **0100** = ios-sapphire 0141（IORPC.kernelContent，Xcode 16 iig 需要）；xnu.yml 加 `runner` 输入（默认仍 macos-14）。
+  试 macos-15：`gh workflow run xnu.yml -R zosminer/ios-picasso --ref main -f runner=macos-15` → run 41253855880
+  **成功**（Xcode 16.0 / 16A242d，9 分半，只跳过 4 个 dxb 补丁），内核 17320240 字节，产物 `xnu/out-0100/`，含 0098/0099 字符串。
+  上机通过后把 xnu.yml 默认 runner 改成 macos-15。
+- **k9**（sha256 9c561800…）= Xcode 16 内核（0098+0099+0100）+ k5 命令行（不带 GPU 参数，单测充电和新工具链）。
+  用户说 6% 电量够用，2026-11-01 00:00 UTC fastboot boot OKAY。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
