@@ -209,6 +209,10 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   没有守护进程崩溃循环。nanotimekitcompaniond 被 LaunchServices.ApplicationsChanged 拉起 42 次 → 加进 cleanbase（下次做镜像才生效）。
 - **k7**（sha256 37bc09a8…）= k6 + `picassogpu=2 picassogpudelay=60 picassogpuslow=1200`，0097 内核不变：测 0091 第 2 步
   （开 CX GDSC 和 GMU 时钟、CM3 按在复位、读 GMU 寄存器和常开计数器，然后恢复）。已从 OrangeFox `adb reboot bootloader` 后 fastboot boot。
+  用户当晚睡着，没看到结果；手机跑了一夜（2026-11-01 早上电脑上 adb/fastboot 都看不到它）。
+- 0098 CI run 41203188095 成功（只跳过 4 个 dxb 补丁，内核里有 "sample failed, keeping last value"），产物在 `xnu/out-0098/`。
+  **k8**（sha256 a472b6ef…）= 0098 内核 + k7 的命令行。计划：用户进 fastboot → 先进 OrangeFox 拉 k7 日志
+  （如果 GPU 第 2 步把手机弄死，日志会停在那里；如果没事，跑一夜环形日志可能已经覆盖掉）→ 再 fastboot boot k8。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
