@@ -134,6 +134,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   新 C 文件用 SDK 内核头 `-Wall -Wextra` 语法检查无警告（sweet_usb.c 只剩 SDK 里没有的私有 KPI 报错，与改动无关）。
   **没做过真正的内核编译，也没上机。**
 
+### 第一次上机（2026-10-31，我们这台手机）
+- 手机：picasso，MIUI V13.0.3.0.SGICNXM（Android 12），与 `firmware/V13.0.3.0.SGICNXM/boot.img` 同版本；
+  `ro.boot.flash.locked=0`、`vbmeta.device_state=unlocked`、verifiedbootstate orange（已解锁）；无 A/B（slot_suffix 空）；电量 64% 充电中。
+- **`fastboot boot` 在我们这台上被接受（已观测）**：`fastboot boot shim/out/shim-boot.img`（诊断 shim，无负载，1772 KB，
+  sha256 fe31e1d3…）→ `Sending OKAY 0.049s / Booting OKAY 0.139s`。与 minhtritt 那台（"Load Error"）不同，
+  所以我们可以一直用只进内存的临时启动，不必刷 boot 分区。屏幕结果（ABL x0、DRAM banks、UFS 探测）等用户拍照。
+
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
   - `sweetusbsmmu` 默认改为 0（不碰 SMMU）。`=1` 只读报告，`=2` 还把 SID 0xe0 的 S2CR 改成旁路
