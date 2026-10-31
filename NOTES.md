@@ -199,6 +199,9 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **k6 是新镜像的第一次启动**（usermanagerd：`diskLoadUserSessions failed / NO USER SESSIONS / Creating New Primary Session`），
   k5 是旧镜像的第二次启动（k4 是第一次，也出现过两三次苹果 logo、很久才进界面）。推测：首次启动问题，或 cleanbase 删掉的任务（coreduetd 等）
   在 k5 里间接拉起了 lsd。验证：从 OrangeFox `adb reboot bootloader`（不用按键）后再次 `fastboot boot shim-boot-k6.img`（第二次启动），已执行。
+- **k6 第二次启动进了 iOS 界面**（用户观测，"开机慢"）：音量加、音量减、电源键都正常（0097 的 GPIO5 修复在真机上有效）。
+  所以 k6 第一次卡住是首次启动的问题，不是 cleanbase 删多了（这点是推测，第二次启动的日志还没拉）。
+  用户感觉"可能还是没有 gpu 驱动"：对，目前全部是 CPU 软件绘制，picassogpu=1 只读时钟树。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
