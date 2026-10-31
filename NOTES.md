@@ -139,7 +139,41 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `ro.boot.flash.locked=0`、`vbmeta.device_state=unlocked`、verifiedbootstate orange（已解锁）；无 A/B（slot_suffix 空）；电量 64% 充电中。
 - **`fastboot boot` 在我们这台上被接受（已观测）**：`fastboot boot shim/out/shim-boot.img`（诊断 shim，无负载，1772 KB，
   sha256 fe31e1d3…）→ `Sending OKAY 0.049s / Booting OKAY 0.139s`。与 minhtritt 那台（"Load Error"）不同，
-  所以我们可以一直用只进内存的临时启动，不必刷 boot 分区。屏幕结果（ABL x0、DRAM banks、UFS 探测）等用户拍照。
+  所以我们可以一直用只进内存的临时启动，不必刷 boot 分区。屏幕结果（ABL x0、DRAM banks、UFS 探测）用户没拍。
+- **内核 CI 第一次就编过**：github.com/zosminer/ios-picasso（用户账号，公开），run 41183466092，产物 xnu-kernel，
+  `kernel.development.sweet` 17337144 字节；字符串检查 0082-0096 的新代码全部在内（只有 dxb 自带的 4 个补丁被跳过，正常）。
+- **第一次带内核启动（k1）**：`shim-boot-k1.img`（sha256 7879cd8b…），命令行
+  `debug=0x14e cpus=1 keepsyms=1 -noprogress rd=ufsroot0 sweetusb=1`，fastboot boot OKAY。
+  屏幕（用户照片）：只有一行 **`SWEET EARLY 20: kprintf startup complete`**，之后没有别的字。
+  已观测：shim 找到负载、跳进内核、MMU 开启、早期标记画在正确的面板地址上（0xa0000000），serial_init 返回。
+  推测：之后的 kprintf 在 DEVELOPMENT 内核里默认不输出（NOTES 旧条目：要 `-enable_kprintf_spam`），所以看不出停在哪。
+  下一版 k2 只加 `-enable_kprintf_spam`（sha256 见下），让内核日志画到屏幕上。
+- **k2**（`-enable_kprintf_spam`，sha256 da1362c2…）：屏幕满屏内核日志，已观测到 initialize_screen b=A0000000 w=1080 h=2400、
+  `pe_arm_map_interrupt_controller: failed to find the interrupt-controller`（sweet 同样，GIC 由 SWEET GIC 代码处理）、
+  SWEET GIC vtimer 19、SWEET PRNG、SWEET pthread、SWEET CPU cpu=0 initCPU、Skywalk 自检全过，**最后一行
+  `bsd_autoconf: calling kminit`**，之后不动（1 分钟）。kminit 之后是伪设备初始化、IOKitBSDInit（IOKit 驱动匹配），
+  再后才是 UFS 找根分区。kprintf 能看到，但 printf/IOLog 不走 fbcon，所以分不清卡在哪。
+- **k3** = k2 + `serial=3`（sha256 ccbdea8d…）：让 printf/IOLog 也画到 fbcon 上，看停在哪个驱动。
+- **iOS 根镜像做好了**：在 Lima Ubuntu 24.04 虚拟机（`limactl`，实例 iosbuild，Docker Desktop 的内核没有 hfsplus 模块所以不用它）
+  里跑 `research/build-root-vm.sh`（mkiosroot.sh + sweet-root-tweaks.py + img2simg），IPSW sha1 5606c298… 校验过，
+  OS 087-86698-044 / SystemOS 087-86593-047 / AppOS 087-86715-047；16 GiB HFS+ 用了 12 GiB，fsck 干净，
+  BoundingPathData.bundle 在。输出 `research/ios16-root.simg`（12145250684 字节，sha256 2ad070b8…，不入库）。
+  tweaks 警告：没有 mobileactivationd 系统容器，跳过 data ark。
+- **用户确认后已把 iOS 根写入 userdata**（2026-10-31，MIUI 数据已清空，用户说无需备份）：
+  `fastboot -S 512M flash userdata research/ios16-root.simg`，24/24 块 OKAY，总计 305 s。手机现在进不了 MIUI；
+  要回 MIUI：fastboot 下 `fastboot erase userdata` 后让 MIUI 重建（或 `fastboot -w`），boot 分区从未改动。
+- **k4**（sha256 见命令输出）= 完整用户空间命令行：`debug=0x14e serial=3 cpus=1 keepsyms=1 -noprogress -enable_kprintf_spam
+  rd=ufsroot0 ufsrw=1 rootrw=1 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin wdt=-1
+  launchd_unsecure_cache=1 ufslogsecs=1 sweetusb=1`。ufsrw=1 让内核把控制台环形日志每秒写到 userdata 最后 4 MiB
+  （镜像只占前 16 GiB，不冲突），以后可以读日志而不用拍照（需要一个带 adb 的 recovery）。
+- **🎉 k4 启动进了 iOS 界面（2026-10-31，用户观测）**：屏幕滚日志，出现过两三次苹果 logo，然后看到 iOS 界面，"就是很卡"。
+  照片里已观测：`exec xpcproxy`/`exec bluetoothd`/`exec fairplayd.H2` 反复重启（无硬件，sweet 上也一样），
+  SpringBoard[26]、backboardd 的线程采样（SMP … pc/lr，sweet_sample 的输出）、
+  `SWEET KEYS: read error pon-ok=1 gpio-ok=0 arb-status=0x1`（音量上 GPIO6 读不到，电源/音量下正常；待查）。
+  卡的原因（推测）：cpus=1 只开 1 个核；serial=3 + kprintf_spam 把每条日志画到屏幕上；sweetfb_hz 默认 10 帧；
+  CPU 频率保持 ABL 留下的档位。
+- **k5**（sha256 见下）= 去掉 serial=3/-enable_kprintf_spam，`cpus=8 sweetfb_noconsole=1 sweetfb_hz=30 picassocpufreq=2`
+  （另一台 K30 上 cpus=8 可用；cpufreq=2 亮屏用最高非加速档）。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
