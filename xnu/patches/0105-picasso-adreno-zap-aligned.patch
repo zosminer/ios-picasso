@@ -1,0 +1,68 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -1905,27 +1905,51 @@ step_zap(void)
+ 	}
+ 	memcpy((void *)page, mdt, mdt_size);
+ 	to_memory(page, PAGE_SIZE);
+-	printf(TAG ": %u: TrustZone first gives up any zap shader it has: %s\n", step, zap_unload() ? "yes" : "it says no");
+-	if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
+-	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
+-		printf(TAG ": %u: TrustZone does not take the signature (%#llx)\n", step, answer);
+-		return false;
++	/*
++	 * k13：PAS_MEM_SETUP(13, 0x8bc15400, 0x1000) 返回 -0x300046。设备树 pil_gpu_region 从 0x8bc15400 起、
++	 * 长 0x2000，起点不是 4K 整页。ios-apollo（同系列 Adreno 650，Mi 10T）这一步用的是整页对齐的地址
++	 * （0x8681a000），TrustZone 一次就接受。所以先试区域里第一个整页对齐的位置 0x8bc16000（0x8bc16000-0x8bc17000
++	 * 在 pil_gpu_region 里面），不行再试设备树原值。boot-arg picassozapaddr=0x... 可以指定唯一的候选地址。
++	 * 每个候选都重新走一遍：先 PAS_SHUTDOWN 清掉，再交签名，再设置内存。MEM_SETUP 被拒绝时内存没有被保护，不写。
++	 */
++	uint64_t candidates[2] = { 0x8bc16000ull, ZAP_MEMORY };
++	unsigned candidate_count = 2;
++	uint64_t forced = 0;
++	if (PE_parse_boot_argn("picassozapaddr", &forced, sizeof(forced)) && forced != 0) {
++		candidates[0] = forced;
++		candidate_count = 1;
++	}
++	uint64_t zap_at = 0;
++	for (unsigned c = 0; c < candidate_count && zap_at == 0; c++) {
++		printf(TAG ": %u: TrustZone first gives up any zap shader it has: %s\n", step, zap_unload() ? "yes" : "it says no");
++		if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++		    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++			printf(TAG ": %u: TrustZone does not take the signature (%#llx)\n", step, answer);
++			return false;
++		}
++		printf(TAG ": %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
++		int32_t result = scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU,
++		    candidates[c], 0x1000, &answer);
++		if (result == 0 && answer == 0) {
++			zap_at = candidates[c];
++			printf(TAG ": %u: TrustZone takes the place %#llx\n", step, zap_at);
++		} else {
++			printf(TAG ": %u: TrustZone does not take the place %#llx (returns %d = %#x, answer %#llx)\n", step,
++			    candidates[c], result, (uint32_t)result, answer);
++		}
+ 	}
+-	printf(TAG ": %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
+-	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY, 0x1000,
+-	    &answer) != 0 || answer != 0) {
+-		printf(TAG ": %u: TrustZone does not take the place (%#llx)\n", step, answer);
++	if (zap_at == 0) {
+ 		return false;
+ 	}
+-	/* 0x8bc15400 不在 16K 页边界上：映射整页再加偏移 */
+-	vm_offset_t base = ml_io_map_wcomb((vm_offset_t)(ZAP_MEMORY & ~(uint64_t)PAGE_MASK), PAGE_SIZE * 2);
++	/* 内核页是 16K：映射包含目标的整页，再加偏移（只写 0x1000 字节，都在 pil_gpu_region 里） */
++	vm_offset_t base = ml_io_map_wcomb((vm_offset_t)(zap_at & ~(uint64_t)PAGE_MASK), PAGE_SIZE * 2);
+ 	if (base == 0) {
+ 		return false;
+ 	}
+-	volatile uint8_t *memory = (volatile uint8_t *)(base + (ZAP_MEMORY & PAGE_MASK));
++	volatile uint8_t *memory = (volatile uint8_t *)(base + (zap_at & PAGE_MASK));
+ 	printf(TAG ": %u: write %u bytes of a620_zap.b02 at %#llx (it begins %02x %02x %02x %02x)\n", step, seg_size,
+-	    ZAP_MEMORY, seg[0], seg[1], seg[2], seg[3]);
+-	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader at %#llx", step, ZAP_MEMORY);
++	    zap_at, seg[0], seg[1], seg[2], seg[3]);
++	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader at %#llx", step, zap_at);
+ 	for (uint32_t i = 0; i < 0x1000; i++) {
+ 		memory[i] = i < seg_size ? seg[i] : 0;
+ 	}

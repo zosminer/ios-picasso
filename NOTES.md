@@ -284,6 +284,21 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `picassonozap=1`：不问 TZ，第 18 步改为直接写 RBBM_SECVID_TRUST_CNTL=0（原厂没有 zap 时的做法）。撤回：GBIF halt、zap 卸载、SMMU 上下文 0 关。
   CI 成功，产物 `xnu/out-0103/`。**k12**（sha256 b7ea9e10…）= 0103 + picasso-gpu.adt + k11 命令行，已 fastboot boot。
 - xnu.yml 默认 runner 改成 macos-15（Xcode 16 内核 k9-k12 真机可用；macos-14 11-02 退役）。
+- **k13 结果**（`logs/boot-k13.txt`）：**第 15、16 步通过，3D 核心第一次听命令**。
+  SMR 0 + 掩码 0x401（设备树 gfx3d_user 原样）被 hypervisor 接受（k12 的 0x400 被拒，是同一个坑：要用设备树的掩码）；
+  SQE 微码启动后 ME_INIT 发出，ring 读指针 9/9，RBBM_STATUS 0x1，没有 CP/SMMU 故障：**THE 3D CORE TAKES COMMANDS**。
+  第 17 步：PAS_SHUTDOWN 返回 0；PAS_INIT_IMAGE（a620_zap.mdt，6860 字节）返回 0，**TrustZone 接受 zap 签名**；
+  **PAS_MEM_SETUP(13, 0x8bc15400, 0x1000) 返回 -3145798（= -0x300046），answer 0**，失败。撤回正常。
+- **查 GitHub 的结果**（用户建议）：`aTechGeekDev/ios-apollo`（Mi 10T，SM8250，Adreno 650，同一套 a650 固件）已经把整条路走通：
+  笔记 boot 24 "PAS_MEM_SETUP (image 13, 0x8681a000/0x1000) returns 0 → PAS_AUTH_AND_RESET returns 0 → CP_SET_SECURE_MODE 0 → 出安全模式"，
+  boot 26 "THE GPU DRAWS"（3D 核心的 2D 引擎填三条色带，屏幕上看到）；之后还做了 SweetGPU IOService + Mesa freedreno 桥。
+  已克隆到 `src/.scratch/github-refs/ios-apollo/`（不入库）。
+  **关键差别（推测）**：apollo 的 zap 地址 0x8681a000 是整页对齐；我们设备树 pil_gpu_region@8bc15400 起点末尾是 0x400，不是 4K 整页。
+  小米原厂 peripheral-loader.c 调 mem_setup(region_start, region_end - region_start)，region_start 是 dma 池分配出来的地址（通常整页对齐），
+  所以设备树起点本身不一定是它真正用的地址。
+- **0105**：zap 的 PAS_MEM_SETUP 先试 0x8bc16000（pil_gpu_region 里第一个 4K 整页，0x8bc16000-0x8bc17000 在区域内），
+  不行再试设备树的 0x8bc15400；每个候选都重新 PAS_SHUTDOWN + INIT_IMAGE；`picassozapaddr=0x...` 可以指定唯一候选。
+  成功后才写 b02、AUTH_AND_RESET。失败时 MEM_SETUP 没把内存保护起来，不写。
 - **k12 结果**（`logs/boot-k12.txt`；第一次进 OrangeFox 时手机自己回到 fastboot，再进一次才拉到）：1-14 步成功。
   TrustZone：IS_CALL_AVAILABLE 64 位返回 0/1（接受这个内核的调用），PAS_INIT_IMAGE 和 PAS_AUTH_AND_RESET 都可用，
   PAS_IS_SUPPORTED(13)（非 fast）返回 0、answer 0（含义未知，HackiOS 也说这个问题说明不了什么）。
