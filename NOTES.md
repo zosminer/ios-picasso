@@ -349,6 +349,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **验证顺序**：(1) `picassogpu=3 picassogpukeep=1`：日志要有 `THE GPU IS KEPT ON`、`self-test ... SUBMISSIONS AND FENCES WORK`、`SweetGPU: registered`；
   (2) 根里放 sweet-gpu-test，`sweetnull=sweet-gpu-test` 看它能打开服务、提交 64 个命令缓冲；(3) sweet-gl-test：Mesa 在 GPU 上画三角形（GL_RENDERER 应是 FD620）；
   (4) 加 `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd sweetnull=backboardd` 看桌面。
+- **用户态编好了，镜像做好了（2026-11-01 12:15）**：内核 CI 41270305264 成功（`xnu/out-0110/`，含 SweetGPU/SUBMISSIONS AND FENCES WORK/DYLD_INSERT_LIBRARIES= 等字符串）；
+  用户态 CI 41270529266 成功（artifact sweet-userland → `sweet-userland/`，不入库：libOSMesa.8.dylib 14945776 字节、libsweet-gl 564912、libsweet-ca 69088、libsweet-fix 70624、sweet-gpu-test 69200、sweet-gl-test 71216）。
+  **根镜像**：`research/add-gpu-userland-vm.sh`（在 Lima 里对 `~/iosroot/ios16-root.img` 原地加文件：三个库进 /usr/local/lib，两个测试程序进 /usr/local/bin，
+  launchd 任务 com.sweet.gputest / com.sweet.gltest 开机各跑一次；`tools/add-launchd-job.py` 来自 ios-apollo）+ `research/drop-ntk-vm.sh`（补移 nanotimekitcompaniond）→
+  `research/ios16-root-gpu.simg`（12159920168 字节附近，sha256 c0422826…，522 个 launchd 任务，fsck OK）。
+  踩过的坑：Lima 里没有 `wheel` 组（用 -o 0 -g 0）；`sudo python3` 写不了普通用户在 /tmp 的临时文件（protected_regular）；Lima 的 /tmp 和 macOS 的不是同一个（脚本放仓库目录）。
+  **k17**（0108-0110 内核，`picassogpu=3 picassogpukeep=1`，11:55:17 启动）：用户感觉桌面没变化——正确，桌面还是 CPU 画，要等 sweetinject 才走 GPU。k17 日志还没读。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
