@@ -65,6 +65,26 @@ TOUCH_FW = [('fw01', 'novatek_nt36672c_g7a_fw01.bin'),
 # 不对时开机加 picassotouchfw=N 试，改这里不用重编内核。
 TOUCH_PANEL_FW = [('37_02_0a', 'fw01'), ('37_02_0b', 'fw02'), ('36_02_0c', 'fw03')]
 
+# picasso：Adreno 620 的固件（内核 bsd/dev/picasso_adreno.c，补丁 0101）。高通的二进制，不进 git；
+# tools/picasso-gpu-fw.py 从原厂 vendor.img 取到 research/picasso-gpu-fw/，--gpu-fw=目录 可改。
+# 属性名就是文件名；没有目录就不放 /picasso-gpu（内核那边会说缺哪个，GPU 步骤停在那里）。
+GPU_FW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/picasso-gpu-fw')
+GPU_FW = ['a650_gmu.bin', 'a650_sqe.fw', 'a620_zap.mdt', 'a620_zap.b00', 'a620_zap.b01', 'a620_zap.b02']
+
+
+def gpu_node(fw_dir, ph):
+    props = []
+    for fname in GPU_FW:
+        path = os.path.join(fw_dir, fname)
+        if os.path.exists(path):
+            props.append((fname, open(path, 'rb').read()))
+        else:
+            print(f'warning: {path} missing', file=sys.stderr)
+    if not props:
+        print(f'warning: no GPU firmware in {fw_dir}, no /picasso-gpu node', file=sys.stderr)
+        return None
+    return node('picasso-gpu', [ph(), ('compatible', cstr('qcom,adreno-620'))] + props)
+
 
 def touch_node(fw_dir, ph):
     """/picasso-touch：fw01..fw03 原样放进属性，panel-fw 是 "面板=属性名" 字符串列表。"""
@@ -116,7 +136,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR):
+def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR, gpu_fw_dir=GPU_FW_DIR):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     touch_fw_dir：picasso 触控固件目录（None = 不放 /picasso-touch）。"""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
@@ -275,6 +295,7 @@ def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR):
     pram = node('pram', [ph(), ('reg', u64(panic_base) + u64(PANIC_LOG_SIZE))])
 
     touch = touch_node(touch_fw_dir, ph) if touch_fw_dir and not qemu else None
+    gpu = gpu_node(gpu_fw_dir, ph) if gpu_fw_dir and not qemu else None
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
@@ -289,13 +310,14 @@ def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR):
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs])
-       + ([touch] if touch else []))
+       + ([touch] if touch else []) + ([gpu] if gpu else []))
 
 
 if __name__ == '__main__':
     # picasso：--high-base=0x... / --high-size=0x... 覆盖高位内存段（按诊断 shim 的 DRAM banks 填写）
     # --touch-fw=目录 指定触控固件目录；--no-touch-fw 不放 /picasso-touch
     touch_dir = TOUCH_FW_DIR
+    gpu_dir = GPU_FW_DIR
     for arg in sys.argv:
         if arg.startswith('--high-base='):
             HIGH_PHYS_BASE = int(arg.split('=', 1)[1], 0)
@@ -305,9 +327,13 @@ if __name__ == '__main__':
             touch_dir = arg.split('=', 1)[1]
         elif arg == '--no-touch-fw':
             touch_dir = None
+        elif arg.startswith('--gpu-fw='):
+            gpu_dir = arg.split('=', 1)[1]
+        elif arg == '--no-gpu-fw':
+            gpu_dir = None
     # 默认高位内存段（真机验证过）；--lowmem 回到旧低位窗口，--qemu 也用低位。
     highmem = '--lowmem' not in sys.argv and '--qemu' not in sys.argv
-    root = build(qemu='--qemu' in sys.argv, highmem=highmem, touch_fw_dir=touch_dir)
+    root = build(qemu='--qemu' in sys.argv, highmem=highmem, touch_fw_dir=touch_dir, gpu_fw_dir=gpu_dir)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
