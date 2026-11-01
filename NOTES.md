@@ -309,6 +309,17 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **下一步（对照 ios-apollo / HackiOS）**：(1) 第 19 步：3D 核心的 2D 引擎填三条色带（橙/白/蓝）到我们的内存，读回像素核对；
   (2) 把 GPU "保持开着"（不撤回）并提供 IOService + msm 风格用户接口（ios-apollo 的 SweetGPU.cpp / sweet_gpu.c 0112-0114）；
   (3) 用户态：Mesa freedreno + 假 libdrm + libsweet-ca 桥（ios-apollo/userland，在 backboardd 里注入）。(3) 是让界面真正变流畅的一步，工作量最大。
+- **0106**（CI 41265465632，macos-15）：picasso_adreno.c 第 19 步 `step_frame`：画面缓冲 1080x2400（行距 4352，10 MB，普通分配、映射在 GPU 地址 0x10000000），
+  ring 里 CP_SET_MARKER(12) + RB_CCU_CNTL + 三次 2D 填充（橙 ff8000 / 白 / 蓝 0080ff，自上而下 0-800 / 800-1600 / 1600-2400）+
+  两个 EVENT_WRITE（FLUSH_COLOR_TS 0x1d → 草稿页 +32 写 0x0c0c0c0c；CACHE_FLUSH_TS 0x04 → +16 写 0x0d0e0d0e）+ WAIT_FOR_IDLE；
+  CPU 读回首/中/末像素核对（b g r a：00 80 ff ff / ff ff ff ff / ff 80 00 ff），通过后每 50 ms 抄一次到面板帧缓冲 0xa0000000（行 4320）
+  持续 `picassogpushow` 秒（默认 6）。**RB_CCU_CNTL 默认 0x08000000（A620：Mesa num_ccu 1）**；A650 用 0x18000000（ios-apollo 实测）。
+  不对时 `picassoccu=0x18000000` 或 `0x10000004`（HackiOS A660）。写法抄 ios-apollo 补丁 0110（MIT）和 HackiOS 第 22 步。
+  **k15**（sha256 见命令输出）= 0106 内核 + picasso-gpu.adt + k14 命令行（picassogpuslow=300），已 fastboot boot，等用户回报屏幕上有没有三条色带。
+- **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
+  0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
+  对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
+  GMU/RSCC/PDC 地址已在 picasso_adreno.c 验证、SMMU 流 0 用掩码 0x401 放 SMR 0。picasso_adreno.c 里 `gpu_block_stop()` 之前的内容是"保持开启"要保留的状态（ring、SQE、SMMU 上下文 0、zap 已加载）。
 - **k12 结果**（`logs/boot-k12.txt`；第一次进 OrangeFox 时手机自己回到 fastboot，再进一次才拉到）：1-14 步成功。
   TrustZone：IS_CALL_AVAILABLE 64 位返回 0/1（接受这个内核的调用），PAS_INIT_IMAGE 和 PAS_AUTH_AND_RESET 都可用，
   PAS_IS_SUPPORTED(13)（非 fast）返回 0、answer 0（含义未知，HackiOS 也说这个问题说明不了什么）。
