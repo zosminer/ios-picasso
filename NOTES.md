@@ -284,6 +284,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `picassonozap=1`：不问 TZ，第 18 步改为直接写 RBBM_SECVID_TRUST_CNTL=0（原厂没有 zap 时的做法）。撤回：GBIF halt、zap 卸载、SMMU 上下文 0 关。
   CI 成功，产物 `xnu/out-0103/`。**k12**（sha256 b7ea9e10…）= 0103 + picasso-gpu.adt + k11 命令行，已 fastboot boot。
 - xnu.yml 默认 runner 改成 macos-15（Xcode 16 内核 k9-k12 真机可用；macos-14 11-02 退役）。
+- **k12 结果**（`logs/boot-k12.txt`；第一次进 OrangeFox 时手机自己回到 fastboot，再进一次才拉到）：1-14 步成功。
+  TrustZone：IS_CALL_AVAILABLE 64 位返回 0/1（接受这个内核的调用），PAS_INIT_IMAGE 和 PAS_AUTH_AND_RESET 都可用，
+  PAS_IS_SUPPORTED(13)（非 fast）返回 0、answer 0（含义未知，HackiOS 也说这个问题说明不了什么）。
+  **第 15 步失败**：上下文 0 的寄存器都写进去了（sctlr 0x1127），但 **SMR 0 = 0x84000000（流 0，掩码 0x400）读回 0**，
+  hypervisor 不接受；GMU 的 SMR 1 = 0x84000005 照常可以。撤回正常。
+- **0104**：3D 核心的流表项依次试 SMR 0/3/4/2 + 掩码 0x401（设备树 gfx3d_user 原样），再试 SMR 3/2 + 掩码 0x400；
+  掩码 0x400 时流 1 另找一项（失败不算错）。CI 41261805672。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
