@@ -263,7 +263,8 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **0102**：HFI 布局完全照原厂（预分配 0x60000000 之后：HFI 0x60001000 大小 0x5000、日志 0x60006000 4K；4 个队列头，
   num_active_q 4）；启动前照 adreno_gmu_clear_and_unmask_irqs 清中断、设 GMU2HOST/AO 掩码；GPU 内存改 kmem_alloc_contig；
   失败时打印 4 个队列头的读写指针、HOST2GMU raw、掩码；SMMU 全局故障（SGFSR/GFAR/GFSYNR，未匹配的流比如 4）也打印；
-  回应同时看队列 1 的指针。充电器日志拆两行并列出读失败的地址，MISC 读失败时仍然喂狗。CI 41258318187（macos-15）。
+  回应同时看队列 1 的指针。充电器日志拆两行并列出读失败的地址，MISC 读失败时仍然喂狗。CI 41258318187（macos-15）成功。
+- **k11**（sha256 55ba5c2b…）= 0102 内核 + picasso-gpu.adt + k10 的命令行；从 OrangeFox `adb reboot bootloader` 后 fastboot boot OKAY。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
