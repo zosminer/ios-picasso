@@ -282,6 +282,8 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   SQE_CNTL=1，ME_INIT（0x2f 掩码，8 字）；17 zap：PAS_SHUTDOWN 先清、INIT_IMAGE(mdt 148+6712)、MEM_SETUP(0x8bc15400, 0x1000)、
   写 b02（0x68c 字节，段 2 可重定位 paddr 0x5000 → 区域开头）、AUTH_AND_RESET；18 CP_SET_SECURE_MODE 0、CP_MEM_WRITE 0x600dc0de。
   `picassonozap=1`：不问 TZ，第 18 步改为直接写 RBBM_SECVID_TRUST_CNTL=0（原厂没有 zap 时的做法）。撤回：GBIF halt、zap 卸载、SMMU 上下文 0 关。
+  CI 成功，产物 `xnu/out-0103/`。**k12**（sha256 b7ea9e10…）= 0103 + picasso-gpu.adt + k11 命令行，已 fastboot boot。
+- xnu.yml 默认 runner 改成 macos-15（Xcode 16 内核 k9-k12 真机可用；macos-14 11-02 退役）。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
