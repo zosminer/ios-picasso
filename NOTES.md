@@ -322,6 +322,7 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   桌面先正常显示了，约 1 分钟 GPU 测试跑到第 19 步才崩。**教训：不要在 GPU 线程里自己 ml_io_map 大块内存。**
 - **0107**：SweetFramebuffer.cpp 把面板内存的内核映射（fPixels，已有的 IOSurface 映射）公开为 `sweet_fb_panel_kva/row/height`，
   step_frame 直接用它抄像素，没有就跳过显示（只核对像素）。
+- CI 41266793021（macos-15）成功，产物 `xnu/out-0107/`。**k16** = 0107 内核 + picasso-gpu.adt + k15 命令行，已 fastboot boot，等用户回报色带。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
