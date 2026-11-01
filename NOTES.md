@@ -251,6 +251,19 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   OrangeFox 里 capacity 65 Charging。电量计开机 84%（充电中 OCV 偏高），又不准。
 - **k10**（sha256 41ff5406…）= 0101 内核 + `shim/out/picasso-gpu.adt`（带 /picasso-gpu 固件）+ k5 命令行 +
   `picassogpu=3 picassogpudelay=60 picassogpuslow=1200`：开机 60 s 后跑 GMU 全部 13 步再撤回。已 fastboot boot。
+- **k10 结果**（`logs/boot-k10.txt`，用户无异常，系统照常进桌面）：**第 1-11 步全部成功**——
+  GMU 计数器 19198820 Hz；SMMU idr0 0x4c017e05 / idr1 0x20000005（5 个 SMR、5 个上下文、8 页 × 4K）；
+  DTCM 读写对；cmd-db：gfx.lvl 0x30050（0 64 128 192 256 320 384 416）、cx.lvl 0x30000、mx.lvl 0x30010、
+  xo.lvl 0x300a0、vrm.soc 0x43400、SH0 0x50004、MC0 0x50000、ACV 0x5007c、CN0 0x50074；
+  SMMU 上下文 1 / 流 5 写入并读回一致（hypervisor 放行）；RSC/PDC 微码写入（rscc seq_mem_0 读回 0xeaaae5a0）；
+  固件版本 core 0x20010008、HFI 0x20000001；**放开 CM3 后 FW_INIT_RESULT = 0x100：GMU 固件在跑**；HFI_CTRL_STATUS 1。
+  **第 12 步失败**：性能表（消息 4，59 字）GMU 不回应，GMU2HOST_INTR_INFO 一直 0；GMU 日志只有 5 条（0x21 abababa0，
+  0x23 ×4 deadba55 / 0x3a）。撤回正常，PREPARE_SLUMBER 也没回应。注意 HFI_CTRL_STATUS 在发 CTRL_INIT 之前就已经是 1。
+  SMMU 刚上电时 S2CR/CB 寄存器读到的是随机值（CX 之前没电），CBAR 全 0。
+- **0102**：HFI 布局完全照原厂（预分配 0x60000000 之后：HFI 0x60001000 大小 0x5000、日志 0x60006000 4K；4 个队列头，
+  num_active_q 4）；启动前照 adreno_gmu_clear_and_unmask_irqs 清中断、设 GMU2HOST/AO 掩码；GPU 内存改 kmem_alloc_contig；
+  失败时打印 4 个队列头的读写指针、HOST2GMU raw、掩码；SMMU 全局故障（SGFSR/GFAR/GFSYNR，未匹配的流比如 4）也打印；
+  回应同时看队列 1 的指针。充电器日志拆两行并列出读失败的地址，MISC 读失败时仍然喂狗。CI 41258318187（macos-15）。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
