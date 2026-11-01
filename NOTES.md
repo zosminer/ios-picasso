@@ -1,5 +1,31 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 最新交接（2026-11-01 夜，换机 + Wi-Fi 调查；比下面的内容新）
+
+### 换了一台手机（旧机电池坏了）
+- 新机：同为 picasso，bootloader 已解锁，MIUI **V13.0.5.0.SGICNXM**（旧机是 V13.0.3.0；boot/dtbo 哈希不同，内核编译日期不同，已观测）。
+- 已备份新机 persist/modemst1/modemst2/fsg/fsc/boot/dtbo/vbmeta 到 `backup/new-k30/`（不入库，本机与手机 SHA-256 一致）。
+- 用户确认后已写入 `research/ios16-root-gpu.simg`（sha256 c0422826…，和旧机最后一次写入相同）：24/24 块，306 s。MIUI 数据已清空。
+- **首次启动慢**（已观测）：k29 两次、k30a 一次，在苹果 logo 停了 13 分钟以上仍没出桌面，无 panic。第三次（k30a，22:18 启动）约 16 分钟内自己进了桌面（用户报告，没读日志）。
+  - 日志（`logs/boot-newk30-k29.txt`、`-run2.txt`、`-k30a.txt`，不入库）显示卡点相同：SpringBoard 主线程在 `LSContextInit` 等锁；lsd t3 在 `WAITING_FOR_THE_DATABASE_TO_FINISH_SEEDING`；
+    **lsd t1 卡在 `MIInstallationIdentity → __GenerateBuiltInAppInstallSessionID → libMobileGestalt` 的一个信号量上**。内核无 panic，GPU 初始化与旧机一致（625 MHz，提交数一致），面板 37_02_0b/触屏 fw02 与旧机相同。
+  - **未知**：MobileGestalt 在等谁；为什么旧机用同一镜像首次开机没有这个问题。猜测（未验证）：与新机的某个设备相关值有关，或首次建库本来就很慢而旧机碰巧快。
+  - 下一步想法：k30b 采样加上 MobileGestaltHelper 等（注意 proc_name 可能把名字截到 16 个字符，`containermanagerd`、`MobileGestaltHelper` 在 k30a 里没采到）；再启动一次对比有没有变快（LaunchServices 库此时应已落盘）。
+- `shim/out/shim-boot-k30a.img` = k29 命令行 + `sweetsample=SpringBoard,lsd,containermanagerd,cfprefsd,installd,runningboardd`（命令行 601/608 字节，已接近上限）。
+- k29 的 bench 有两处错：memcpy 被编译器优化掉（0 ms）；ALU 各线程都是 499 ms（疑似被截断到 500 ms）。数据无效，要修后才能下结论。
+
+### Wi-Fi 调查（只读，未写代码）
+- 已观测（原厂设备树 `picasso-merged.dts`）：WCN3990，`qcom,icnss@18800000`（SNOC，不是 PCIe），MSA 固定区 `modem_wlan_region@8c000000`，`pil_wlan_fw_region@8ba00000`，
+  SMP2P 条目 "wlan"；蓝牙是 `bt_wcn3990`（UART+slimbus）。我们自己的内核里目前**没有任何基带（modem）启动代码**；之前写的"基带 PAS 能起"是 minhtritt 那台 K30 的观察。
+- 参考：`../.scratch/github-refs/ios-apollo/`（0126-0129 Wi-Fi 补丁 + `wifi/lx` Linux 兼容层）。**传输层不能复用**（它是 QCA6390 的 PCIe+MHI），**能参考**：HackiOS `lx` 兼容层、
+  en0 网口与 Apple80211 ioctl 对接（0128/0129）、QRTR/QMI 辅助代码的写法。
+- 阶段划分（推测的工作量，未验证）：
+  1. 启动基带：从 `modem` 分区取固件，用 TrustZone PAS（和 GPU zap 的 PAS 13 同一类 SMC，见 0103/0105）装载并启动，加 SMP2P、GLINK、QRTR。**成功标准：日志里看到 QRTR 公布 WLFW 服务 0x45。**
+  2. WLFW QMI 握手（MSA 内存、板级数据、校准）。
+  3. WCN3990 的 CE/HTC/WMI/HTT：把 Linux ath10k（snoc 后端）用 LinuxKPI 编进内核。
+  4. iOS 一侧：en0 + Apple80211 ioctl（扫描、关联、WPA）。
+- 风险：每一阶段都要靠上机验证；阶段 1 需要读 `modem` 分区（只读）。
+
 ## picasso（红米 K30 5G，SM7250）移植：交接记录（2026-10-22，最先阅读）
 
 本分支 `picasso` 基于 ios-sweet 425b251，目标是在红米 K30 5G（picasso，骁龙 765G / SM7250，8 GB 内存，

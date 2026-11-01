@@ -456,6 +456,91 @@ cmd_info(struct buf *out)
 	}
 }
 
+
+/* ---- bench：CPU 单线程 / 并行 / 内存带宽（找"渲染线程落在慢核上"和"DDR 在最低频"）---- */
+#include <mach/mach_time.h>
+#include <mach/thread_act.h>
+
+static double
+ms_since(uint64_t t0)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	return (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e6;
+}
+
+/* 一条相依的整数链：时间只取决于核的速度，不取决于内存 */
+static void *
+alu_thread(void *arg)
+{
+	volatile uint64_t sink;
+	uint64_t x = 88172645463325252ull, t0 = mach_absolute_time();
+
+	for (uint64_t i = 0; i < 150000000ull; i++) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+	}
+	sink = x;
+	(void)sink;
+	*(double *)arg = ms_since(t0);
+	return NULL;
+}
+
+static void
+cmd_bench(struct buf *out)
+{
+	double ms[8];
+	pthread_t t[8];
+
+	bprintf(out, "ALU 单线程 x6（150M 步；快核约几百 ms，慢核更久；每次可能落在不同的核）:");
+	for (int i = 0; i < 6; i++) {
+		double one = 0;
+
+		alu_thread(&one);
+		bprintf(out, " %.0f", one);
+		usleep(30000);
+	}
+	bprintf(out, " ms\n");
+	for (int n = 2; n <= 8; n += 2) {
+		for (int i = 0; i < n; i++) {
+			pthread_create(&t[i], NULL, alu_thread, &ms[i]);
+		}
+		bprintf(out, "ALU %d 个线程同时:", n);
+		for (int i = 0; i < n; i++) {
+			pthread_join(t[i], NULL);
+			bprintf(out, " %.0f", ms[i]);
+		}
+		bprintf(out, " ms\n");
+	}
+	{
+		size_t size = 32u << 20;
+		char *a = malloc(size), *b = malloc(size);
+
+		if (a != NULL && b != NULL) {
+			memset(a, 1, size);
+			memset(b, 2, size);
+			for (int r = 0; r < 3; r++) {
+				uint64_t t0 = mach_absolute_time();
+
+				for (int i = 0; i < 8; i++) {
+					memcpy(b, a, size);
+				}
+				double ms_all = ms_since(t0);
+
+				bprintf(out, "memcpy 32 MiB x8: %.0f ms = %.2f GB/s（拷贝量，读+写各一次）\n", ms_all,
+				    (8.0 * size / 1e9) / (ms_all / 1e3));
+			}
+		}
+		free(a);
+		free(b);
+	}
+	bprintf(out, "done\n");
+}
+
 static int
 dispatch(int sock, char *line)
 {
@@ -509,6 +594,8 @@ dispatch(int sock, char *line)
 				first = 3;
 			}
 			ok = cmd_run(&out, argv + first, timeout > 0 ? timeout : 30);
+		} else if (!strcmp(c, "bench")) {
+			cmd_bench(&out);
 		} else if (!strcmp(c, "sysctl") && argc >= 2) {
 			ok = cmd_sysctl(&out, argv[1]);
 		} else if (!strcmp(c, "kill") && argc >= 3) {
