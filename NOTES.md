@@ -368,6 +368,16 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
     疑点（待查）：chg_st1=47 与之前 03/04 不同；我们的 picassocharge 喂狗在新镜像下是否有影响；USB 线接触。
   - **结论：第 2 步（GPU 常开 + 服务）和第 3 步的"Mesa 在 GPU 上能跑"都已在真机验证。** 剩下：把 CoreAnimation 桥注入 backboardd，让桌面走 GPU：
     `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd sweetnull=backboardd`（库已在镜像里）。
+- **电池/充电（用户说这块电池可能不好）**：OrangeFox 里连续读：电压 3704-4054 mV 乱跳、电流在 -195…+275 mA 之间来回，容量始终显示 1%（废值，只信电压）。
+  过一阵稳定在 3.92-4.05 V、-300…-650 mA 充电。k18 日志里充电器 `chg_st1=47`（低三位 7 = DISABLE_CHARGE）、`icl_st=00`、`apsd_result` 00/04 跳：
+  **从第一次读（我们的代码还没写任何东西）就是这个状态，日志里没有 "charging enable command was off" / "USB input was suspended" / "pet refused"，说明不是喂狗代码造成的**——
+  是 iOS 起来后 USB 输入没被识别（线/口）+ 弱电池 + 首次开机 8 核满载 → 掉压断电。对策：测试前先在 OrangeFox 里充到电压稳定在 ≥3.9 V，插墙上的充电头；首次开机用 `picassocpufreq=0`（低功耗）。
+- **k19**（13:42:45，0110 内核，`picassocpufreq=0 picassogpu=3 picassogpukeep=1 picassogpudelay=30 sweetnull=sweet-gpu-test,sweet-gl-test`，无 sweetinject）：新镜像首次开机重试，结果待读。
+- **k20 = 启用 sweetinject（sha256 fd974feb…）**：k19 的参数 + `picassogpudelay=15 sweetnull=backboardd,sweet-gpu-test,sweet-gl-test sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd sweetgl_wait=240`
+  （命令行 453 字节，上限 608）。libsweet-ca 的行为（userland/ca-bridge/sweet_ca.c）：只在 backboardd 里生效；等 SweetGPU 服务最多 `sweetgl_wait` 秒（默认 60，我们的 GPU 比 ios-apollo 起得晚所以给 240）；
+  库不在 / 没等到 GPU / `sweetgl=0` 都**退回软件渲染而不是崩**；成功会打 `sweet-ca: SweetGPU is there (waited X s): loading /usr/local/lib/libsweet-gl.dylib`，之后 libsweet-gl 打 `sweet-gl:` 行（每帧统计等）。
+  **回退**：去掉 `sweetinject=`（或加 `sweetgl=0`）就回到软件渲染桌面。**唯一会让 backboardd 起不来的情况**：参数里点名的库文件在镜像里缺失（dyld 找不到被插入的库就中止进程）——库已在镜像里，已核对大小。
+  日志要看的：`sweet-ca:` / `sweet-gl:` 行、有没有 backboardd CRASH、屏幕是否正常、`SweetGPU: submission N` 的计数是否持续增长（= 桌面真的在往 GPU 提交）。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
