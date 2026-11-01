@@ -410,6 +410,14 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **未验证**：iOS 里 sweetusb=2 + 弱电池；configd 里线程能否监听；macOS 对 CDC-ECM 的支持。
   **Wi-Fi / 蓝牙现状（诚实）**：都**不工作**。这台是 WCN3990（icnss/SNOC + 蓝牙 UART/slimbus），不是 ios-apollo 的 QCA6390（PCIe）；ios-apollo 的 wifi 补丁 0126-0129 不能直接用。基带 PAS 能起、GLINK/QRTR 通，但 wlan_pd 不起（见 480 行）。bluetoothd 在重启循环。这是单独的大项目，有了调试代理才好做。
   亮度：`picassobl` 驱动在（默认启用？见 586 行），未单项复测。
+- **k26/k27 结果与批处理代理（2026-11-01 16:xx）**：
+  - **k26**（`sweetusb=2` + 750 MHz）没留下日志：手机在写第一条日志前就挂住/重启（我们拉到的 `logs/boot-k26.txt` 实际是 k25a 的）。推断：`sweetusb=2`（USB 设备模式）在这台上 2-3 秒后整机重启，同型号手机（minhtritt）有同样记录（见 0090 段）。**所以 USB 网络上的 TCP 代理暂时用不了**。
+  - **k27**（`sweetusb=1`，`picassogpuspeed=8` = 750 MHz）：**0114 起作用了**：`SWEET FILES: ... 53488 bytes written`，代理在 configd 里起来了（`|configd| sweet-agent: batch ...`）。代理改成**批处理模式**：开机读 `/usr/local/etc/sweet-agent.cmds`（`tools/root-files/agent-diagnose.cmds`，用 `mkadt.py --file` 带进去），输出走 configd 的 stderr（需要 `sweetnull=...,configd`），日志里 `grep -a "|agent|"`。镜像里只有 /bin/ps、/bin/df、/usr/bin/vm_stat、taskinfo、/usr/sbin/ioreg（没有 netstat/sh/ls/cat/launchctl）。
+  - **750 MHz 不能用**：第 13 步（OOB GPU 请求）失败，GMU 没把核心拉起来，GPU 撤回，桥库等满 240 s 后退回软件渲染 → 整个 k27 是软件桌面（慢；资源库/今天视图下半屏黑——软件渲染做不了背景模糊，GPU 桥有 sgl_vblur，**推断**：GPU 路径下不黑）。750 对应 gfx.lvl 384，cmd-db 的 mx.lvl 没有 384。**k28 改用 `picassogpuspeed=5`（625 MHz，lvl 256）**；已验证可用：400、500 MHz。
+  - **实测**（k27 空闲，46 s）：没有进程占 CPU（最高 2.5%），内存充足（free 63214 页 × 16 KB），根盘 78%。→ 卡顿不是后台进程造成的，是渲染。语言已是 `zh-Hans`（用户在设置里改的，写进了 .GlobalPreferences.plist）。背光 `kern.picasso_backlight` = 1023/4095（约 25%）。
+  - **Wi-Fi / 蓝牙：实测完全不存在**（ioreg 里没有 IO80211 控制器、BSD 网口、蓝牙设备，只有 3 处 IONetworkInterface 字样）。WCN3990 走 icnss：要先让基带的 wlan_pd 起来（modem PAS 能起、GLINK/QRTR 通），再做 WLFW QMI + 固件（wlanmdsp 在 modem 里）+ 一个 iOS 的 IO80211 驱动；蓝牙是 UART（qca,wcn3990）+ HCI。都是大项目，没开始。
+  - **下一个大杠杆（未做）：DDR 带宽投票**。GMU 的 bw 表只有"关"一档，CPU 侧也没有 bwmon，DDR 很可能一直在最低频，这同时拖慢 GPU 采样和 CPU 的 10 MB 拷屏。要做：RPMh BCM（SH0/MC0/ACV）按 Linux a6xx_bw_votes 填 ddr_data[level]，并把 vote[2]（带宽档）设成高档。
+  - 待办：关于本机打不开（k24 软件渲染下也打不开；日志无 CRASH）；设置里"播客"页 Preferences SIGTRAP 在 PodcastsUI（无关）；图标不完整是 GPU 桥问题（`glcopy=1` 的结果 k25a 用户没反馈）。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、

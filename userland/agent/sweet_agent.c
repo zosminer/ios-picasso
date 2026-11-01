@@ -7,6 +7,12 @@
  * 电脑一侧是 192.168.7.1）。只绑 USB 这个地址，不绑所有网口：以后 Wi-Fi 通了也不会暴露。没有认证——
  * 这是开发机，连的是一根 USB 线。
  *
+ * **批处理模式（picasso 的 USB 设备模式会重启整机，TCP 暂时用不了）**：开机后读 /usr/local/etc/sweet-agent.cmds，
+ * 一行一条命令（和 TCP 的命令一样），结果写到 stderr（内核转发进日志），内核把它写进 userdata 末尾的日志环，用
+ * tools/sweet-log-pull.sh 经 recovery 读出（输出行带 "|agent| " 前缀）。文件里的特殊行：
+ *   # 注释 | sleep N（等 N 秒）| wait-process 名字 [最多秒数]（等到某个进程在跑，用 ps 查）
+ * 命令文件用 mkadt.py --file /usr/local/etc/sweet-agent.cmds=本地文件 随 boot 镜像带进手机（xnu 0114）。
+ *
  * 协议：每个请求一行文本（空格分隔，可以用双引号），回复是 "OK <n>\n" 或 "ERR <n>\n" 加 n 字节正文。
  * put 的请求行后面紧跟 <len> 字节内容。命令：
  *   ping | info | ls PATH | stat PATH | cat PATH [OFF [LEN]] | put PATH MODE LEN | rm PATH | mkdir PATH [MODE]
@@ -30,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/proc.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -53,18 +60,16 @@ say(const char *fmt, ...)
 {
 	char line[256];
 	va_list ap;
-	int fd, n;
+	int n;
 
 	va_start(ap, fmt);
 	n = vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
-	if (n <= 0) {
-		return;
+	if (n > (int)sizeof(line) - 1) {
+		n = sizeof(line) - 1;
 	}
-	fd = open("/dev/console", O_WRONLY | O_NOCTTY);
-	if (fd >= 0) {
-		(void)!write(fd, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
-		close(fd);
+	if (n > 0) {
+		(void)!write(2, line, (size_t)n);      /* stderr：内核把它转到日志，带 |进程名| 前缀（和 libsweet-ca 一样） */
 	}
 }
 
@@ -547,6 +552,162 @@ serve(void *arg)
 	return NULL;
 }
 
+
+/* ---- 批处理：命令来自文件，结果到控制台 ---- */
+#define CMDS_FILE       "/usr/local/etc/sweet-agent.cmds"
+#define CONSOLE_MAX     (192u << 10)    /* 每条命令最多往日志里打 192 KiB */
+
+static void
+console_write(const char *tag, const char *text, size_t n, size_t max)
+{
+	int fd = 2;
+	size_t at = 0;
+
+	if (n > max) {
+		n = max;
+	}
+	while (at < n) {
+		const char *nl = memchr(text + at, '\n', n - at);
+		size_t len = nl ? (size_t)(nl - (text + at)) : n - at;
+		char line[1100];
+		int m;
+
+		if (len > 900) {
+			len = 900;
+		}
+		m = snprintf(line, sizeof(line), "|agent| %s%.*s\n", tag, (int)len, text + at);
+		(void)!write(fd, line, (size_t)m);
+		at += len + (nl && len == (size_t)(nl - (text + at)) ? 1 : 0);
+	}
+}
+
+/* 一条命令：借 TCP 那套 dispatch，用一对 socket 接住回复 */
+static void
+run_local(const char *cmd)
+{
+	int sv[2];
+	pthread_t t;
+	pthread_attr_t attr;
+	char head[64], *body;
+	size_t len, got = 0;
+	struct buf all = { 0 };
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+		return;
+	}
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&t, &attr, serve, (void *)(intptr_t)sv[1]) != 0) {
+		close(sv[0]);
+		close(sv[1]);
+		return;
+	}
+	pthread_attr_destroy(&attr);
+	dprintf(sv[0], "%s\n", cmd);
+	if (read_line(sv[0], head, sizeof(head)) == 0 && (!strncmp(head, "OK ", 3) || !strncmp(head, "ERR ", 4))) {
+		len = (size_t)atoll(strchr(head, ' ') + 1);
+		body = malloc(len + 1);
+		while (body != NULL && got < len) {
+			ssize_t r = read(sv[0], body + got, len - got);
+
+			if (r <= 0) {
+				break;
+			}
+			got += (size_t)r;
+		}
+		if (body != NULL) {
+			body[got] = 0;
+			console_write(head[0] == 'O' ? "" : "ERR: ", body, got, CONSOLE_MAX);
+			if (got > CONSOLE_MAX) {
+				console_write("", "[output cut]", 12, 64);
+			}
+		}
+		free(body);
+	} else {
+		console_write("", "[no reply]", 10, 64);
+	}
+	free(all.p);
+	close(sv[0]);        /* serve 读到 EOF 就结束 */
+}
+
+static int
+process_running(const char *name)
+{
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+	size_t size = 0;
+	struct kinfo_proc *list;
+	int found = 0;
+
+	if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || (list = malloc(size)) == NULL) {
+		return 0;
+	}
+	if (sysctl(mib, 3, list, &size, NULL, 0) == 0) {
+		for (size_t i = 0; i < size / sizeof(*list); i++) {
+			if (!strncmp(list[i].kp_proc.p_comm, name, 16 - 1)) {
+				found = 1;
+				break;
+			}
+		}
+	}
+	free(list);
+	return found;
+}
+
+static void *
+batch(void *unused)
+{
+	FILE *f;
+	char line[LINE_MAX_LEN];
+
+	(void)unused;
+	for (int i = 0; i < 600 && access(CMDS_FILE, R_OK) != 0; i++) {   /* 内核在 launchd 之前写好，没有就是没带 */
+		if (i == 0) {
+			sleep(1);
+		}
+		if (i > 3) {
+			return NULL;
+		}
+		sleep(1);
+	}
+	if ((f = fopen(CMDS_FILE, "r")) == NULL) {
+		return NULL;
+	}
+	say("sweet-agent: batch %s (pid %d)\n", CMDS_FILE, getpid());
+	while (fgets(line, sizeof(line), f) != NULL) {
+		size_t n = strlen(line);
+		char text[LINE_MAX_LEN + 16];
+
+		while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) {
+			line[--n] = 0;
+		}
+		if (n == 0 || line[0] == '#') {
+			continue;
+		}
+		if (!strncmp(line, "sleep ", 6)) {
+			sleep((unsigned)atoi(line + 6));
+			continue;
+		}
+		if (!strncmp(line, "wait-process ", 13)) {
+			char name[64] = "";
+			int max = 300;
+
+			sscanf(line + 13, "%63s %d", name, &max);
+			for (int i = 0; i < max && !process_running(name); i++) {
+				sleep(1);
+			}
+			snprintf(text, sizeof(text), "== %s", line);
+			console_write("", text, strlen(text), 400);
+			continue;
+		}
+		snprintf(text, sizeof(text), "== %s", line);
+		console_write("", text, strlen(text), 1000);
+		run_local(line);
+	}
+	fclose(f);
+	say("sweet-agent: batch done\n");
+	return NULL;
+}
+
 static void *
 listener(void *unused)
 {
@@ -565,7 +726,7 @@ listener(void *unused)
 		addr.sin_addr.s_addr = htonl(0xc0a80702);       /* 192.168.7.2：USB 网口，网口还没起来时 bind 失败，重试 */
 		if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(s, 4) != 0) {
 			close(s);
-			sleep(1);
+			sleep(5);
 			continue;
 		}
 		say("sweet-agent: listening on 192.168.7.2:%d (pid %d)\n", AGENT_PORT, getpid());
@@ -605,6 +766,9 @@ agent_start(void)
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 	if (pthread_create(&t, &attr, listener, NULL) != 0) {
 		say("sweet-agent: no thread\n");
+	}
+	if (pthread_create(&t, &attr, batch, NULL) != 0) {
+		say("sweet-agent: no batch thread\n");
 	}
 	pthread_attr_destroy(&attr);
 }

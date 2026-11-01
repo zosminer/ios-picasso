@@ -1,0 +1,16 @@
+# 批处理诊断：libsweet-agent 开机后一条条执行（见 userland/agent/sweet_agent.c 头部）。
+# 输出在日志里以 "|configd| |agent| " 开头（grep -a "|agent|"）。没有 shell：run 后面直接给程序路径。
+# 桌面出来后约 60 秒开始，每 20 秒记一次各进程 CPU：这段时间请在设置里来回滑动，抓"卡的时候谁在占 CPU"。
+wait-process SpringBoard 300
+sleep 60
+run -t 20 /bin/ps -axo pid,%cpu,rss,comm
+sleep 20
+run -t 20 /bin/ps -axo pid,%cpu,rss,comm
+sleep 20
+run -t 20 /bin/ps -axo pid,%cpu,rss,comm
+sleep 20
+run -t 20 /bin/ps -axo pid,%cpu,rss,comm
+sleep 20
+run -t 20 /bin/ps -axo pid,%cpu,rss,comm
+sleep 20
+run -t 10 /usr/bin/vm_stat
