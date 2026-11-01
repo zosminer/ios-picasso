@@ -300,6 +300,15 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   不行再试设备树的 0x8bc15400；每个候选都重新 PAS_SHUTDOWN + INIT_IMAGE；`picassozapaddr=0x...` 可以指定唯一候选。
   成功后才写 b02、AUTH_AND_RESET。失败时 MEM_SETUP 没把内存保护起来，不写。
   CI 41263690158（macos-15）成功，产物 `xnu/out-0105/`。**k14** = 0105 内核 + picasso-gpu.adt + k13 的命令行（picassogpu=3），已 fastboot boot，等用户回报。
+- **🎉🎉 k14 结果（`logs/boot-k14.txt`）：18 步全部通过，3D 核心出了安全模式，并按命令往我们的内存写数。**
+  推测成立：PAS_MEM_SETUP(13, **0x8bc16000**, 0x1000) 返回 0（0x8bc15400 不是整页，被 TrustZone 拒绝；整页对齐的地址一次就过）→
+  写 a620_zap.b02（1676 字节）→ PAS_AUTH_AND_RESET 返回 0 "TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER" →
+  CP_SET_SECURE_MODE 0（ring 读指针 11/11）→ CP_MEM_WRITE（15/15）→ 草稿页读到 0x600dc0de
+  "THE 3D CORE WRITES OUR MEMORY ON COMMAND"。撤回：PREPARE_SLUMBER 接受、zap 卸载返回 0，系统照常进桌面。
+  到这里和 ios-apollo 的 boot 24-25 同一进度。
+- **下一步（对照 ios-apollo / HackiOS）**：(1) 第 19 步：3D 核心的 2D 引擎填三条色带（橙/白/蓝）到我们的内存，读回像素核对；
+  (2) 把 GPU "保持开着"（不撤回）并提供 IOService + msm 风格用户接口（ios-apollo 的 SweetGPU.cpp / sweet_gpu.c 0112-0114）；
+  (3) 用户态：Mesa freedreno + 假 libdrm + libsweet-ca 桥（ios-apollo/userland，在 backboardd 里注入）。(3) 是让界面真正变流畅的一步，工作量最大。
 - **k12 结果**（`logs/boot-k12.txt`；第一次进 OrangeFox 时手机自己回到 fastboot，再进一次才拉到）：1-14 步成功。
   TrustZone：IS_CALL_AVAILABLE 64 位返回 0/1（接受这个内核的调用），PAS_INIT_IMAGE 和 PAS_AUTH_AND_RESET 都可用，
   PAS_IS_SUPPORTED(13)（非 fast）返回 0、answer 0（含义未知，HackiOS 也说这个问题说明不了什么）。
