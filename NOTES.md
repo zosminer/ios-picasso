@@ -299,6 +299,7 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **0105**：zap 的 PAS_MEM_SETUP 先试 0x8bc16000（pil_gpu_region 里第一个 4K 整页，0x8bc16000-0x8bc17000 在区域内），
   不行再试设备树的 0x8bc15400；每个候选都重新 PAS_SHUTDOWN + INIT_IMAGE；`picassozapaddr=0x...` 可以指定唯一候选。
   成功后才写 b02、AUTH_AND_RESET。失败时 MEM_SETUP 没把内存保护起来，不写。
+  CI 41263690158（macos-15）成功，产物 `xnu/out-0105/`。**k14** = 0105 内核 + picasso-gpu.adt + k13 的命令行（picassogpu=3），已 fastboot boot，等用户回报。
 - **k12 结果**（`logs/boot-k12.txt`；第一次进 OrangeFox 时手机自己回到 fastboot，再进一次才拉到）：1-14 步成功。
   TrustZone：IS_CALL_AVAILABLE 64 位返回 0/1（接受这个内核的调用），PAS_INIT_IMAGE 和 PAS_AUTH_AND_RESET 都可用，
   PAS_IS_SUPPORTED(13)（非 fast）返回 0、answer 0（含义未知，HackiOS 也说这个问题说明不了什么）。
