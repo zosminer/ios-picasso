@@ -1,0 +1,126 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -816,6 +816,21 @@ space_faulted(const struct gpu_space *space)
+ 	return true;
+ }
+ 
++/* 一条流表项：SMR 读回不对就清掉这一项（hypervisor 不接受的写读回是 0），返回 false */
++static bool
++space_stream_try(struct gpu_space *space, uint32_t match, uint32_t stream, uint32_t mask)
++{
++	uint32_t want = SMMU_SMR_VALID | mask << 16 | stream;
++	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
++	put(&smmu, "smr", SMMU_SMR(match), want);
++	if (get(&smmu, "smr", SMMU_SMR(match)) == want && (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) == space->context) {
++		return true;
++	}
++	put(&smmu, "smr", SMMU_SMR(match), 0);
++	put(&smmu, "s2cr", SMMU_S2CR(match), SMMU_S2CR_FAULT);
++	return false;
++}
++
+ static bool
+ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
+ {
+@@ -843,13 +858,16 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
+ 		return false;
+ 	}
+ 	put(&smmu, "cb sctlr", cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
+-	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
+-	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+-	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+-	    (get(&smmu, "s2cr", SMMU_S2CR(match)) & 0x300ff) != space->context ||
+-	    (get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
++	if ((get(&smmu, "cbar", smmu_page + SMMU_CBAR(space->context)) & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
+ 	    !(get(&smmu, "cb sctlr", cb + SMMU_CB_SCTLR) & 1) ||
+ 	    get(&smmu, "cb ttbr0 lo", cb + SMMU_CB_TTBR0) != (uint32_t)root) {
++		printf(TAG ": %u: the SMMU did not take context %u\n", step, space->context);
++		return false;
++	}
++	if (match == ~0u) {
++		return true;            /* 流表另外配（space_stream_try） */
++	}
++	if (!space_stream_try(space, match, stream, SMMU_STREAM_MASK)) {
+ 		printf(TAG ": %u: the SMMU did not take what was written: stream %u is not going through context %u\n", step,
+ 		    stream, space->context);
+ 		return false;
+@@ -1588,8 +1606,7 @@ step_tz(void)
+ #define CORE_RING_SIZE          0x8000u
+ #define CORE_SQE_ADDRESS        0x01100000u
+ #define CORE_SCRATCH_ADDRESS    0x01200000u
+-#define CORE_MATCH              0u
+-#define CORE_STREAM1_MATCH      2u
++static uint32_t core_match = ~0u, core_stream1_match = ~0u;
+ static struct gpu_space core_space = { .name = "the 3D core", .context = 0, .control = 1u << 8 };
+ static struct gpu_block core_ring, core_sqe, core_scratch;
+ static bool core_space_is_on, core_stream1_is_on, core_runs, zap_is_loaded;
+@@ -1721,16 +1738,42 @@ step_core_space(void)
+ 	announce("give SMMU context 0 these tables and send the 3D core's streams 0 and 1 through it "
+ 	    "(device tree gfx3d_user iommus = <kgsl_smmu 0 0x401>)");
+ 	core_space_is_on = true;
+-	if (!space_on(&core_space, CORE_MATCH, 0)) {
++	if (!space_on(&core_space, ~0u, 0)) {
+ 		return false;
+ 	}
+-	core_stream1_is_on = true;
+-	put(&smmu, "s2cr", SMMU_S2CR(CORE_STREAM1_MATCH), core_space.context);
+-	put(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | 1);
+-	if (get(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | 1)) {
+-		printf(TAG ": %u: the SMMU did not take stream 1\n", step);
++	/*
++	 * k12：SMR 0 = 有效 | 掩码 0x400 | 流 0 读回 0（hypervisor 不接受）。依次试：设备树原样的掩码 0x401
++	 * （流 0 和 1 一起）放在 SMR 0、3、4、2，再试掩码 0x400 放在 3、2。GMU 已经占了 SMR 1。
++	 */
++	static const struct {
++		uint32_t match, mask;
++	} tries[] = { { 0, 0x401 }, { 3, 0x401 }, { 4, 0x401 }, { 2, 0x401 }, { 3, 0x400 }, { 2, 0x400 } };
++	for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
++		if (tries[i].match == gmu_match || tries[i].match >= smmu_matches) {
++			continue;
++		}
++		if (space_stream_try(&core_space, tries[i].match, 0, tries[i].mask)) {
++			core_match = tries[i].match;
++			printf(TAG ": %u: THE SMMU TAKES the 3D core's stream 0 at SMR %u with mask %#x\n", step, core_match,
++			    tries[i].mask);
++			break;
++		}
++		printf(TAG ": %u: SMR %u with mask %#x: not taken\n", step, tries[i].match, tries[i].mask);
++	}
++	if (core_match == ~0u) {
++		printf(TAG ": %u: the hypervisor takes no stream table entry for the 3D core\n", step);
+ 		return false;
+ 	}
++	if (!(rd(smmu.base + SMMU_SMR(core_match)) & (1u << 16))) {
++		/* 掩码 0x400 只管流 0：流 1 另找一项（A620 没有 LPAC，流 1 可能用不上，失败不算错） */
++		for (uint32_t m = 2; m < smmu_matches && !core_stream1_is_on; m++) {
++			if (m != core_match && m != gmu_match && space_stream_try(&core_space, m, 1, SMMU_STREAM_MASK)) {
++				core_stream1_match = m;
++				core_stream1_is_on = true;
++				printf(TAG ": %u: stream 1 at SMR %u\n", step, m);
++			}
++		}
++	}
+ 	get(&gpu, "rbbm_status", RBBM_STATUS);
+ 	return !space_faulted(&core_space);
+ }
+@@ -2002,13 +2045,17 @@ gpu_block_stop(void)
+ 		zap_is_loaded = false;
+ 	}
+ 	if (core_stream1_is_on) {
+-		put(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH), 0);
+-		put(&smmu, "s2cr", SMMU_S2CR(CORE_STREAM1_MATCH), SMMU_S2CR_FAULT);
++		put(&smmu, "smr", SMMU_SMR(core_stream1_match), 0);
++		put(&smmu, "s2cr", SMMU_S2CR(core_stream1_match), SMMU_S2CR_FAULT);
+ 		core_stream1_is_on = false;
+ 	}
+ 	if (core_space_is_on) {
+ 		space_faulted(&core_space);
+-		space_off(&core_space, CORE_MATCH);
++		if (core_match != ~0u) {
++			space_off(&core_space, core_match);
++		} else {
++			put(&smmu, "cb sctlr", smmu_context(&core_space) + SMMU_CB_SCTLR, 0);
++		}
+ 		core_space_is_on = false;
+ 	}
+ 	if (gmu_space_is_on) {
