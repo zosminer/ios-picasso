@@ -1,0 +1,184 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -235,7 +235,11 @@ static struct block gmu = { "gmu", 0x03d6a000, 0x30000, 0 };
+ #define GMU_GMU2HOST_INTR_INFO  G(0x1F992)
+ #define GMU_HOST2GMU_INTR_SET   G(0x1F994)
+ #define GMU_GENERAL_7           G(0x1F9CC)
++#define GMU_AO_HOST_INTR_CLR    G(0x23B04)
+ #define GMU_AO_HOST_INTR_STATUS G(0x23B05)
++#define GMU_AO_HOST_INTR_MASK   G(0x23B06)
++#define GMU_GMU2HOST_INTR_MASK  G(0x1F993)
++#define GMU_HOST2GMU_INTR_RAW   G(0x1F996)
+ #define GMU_RSCC_CONTROL_REQ    G(0x23B07)
+ #define GMU_RSCC_CONTROL_ACK    G(0x23B08)
+ #define GMU_AO_GPU_CX_BUSY      G(0x23B0C)
+@@ -742,8 +746,9 @@ block_new(struct gpu_space *space, struct gpu_block *block, uint64_t address, ui
+ {
+ 	block->address = address;
+ 	block->size = (size + 4095) & ~4095u;
+-	if (kmem_alloc(kernel_map, &block->memory, round_page(block->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/* 物理连续（sweet_ufs.c 的 DMA 内存同样做法）：HFI 页要第二个不缓存映射，固件块整块刷缓存也简单 */
++	if (kmem_alloc_contig(kernel_map, &block->memory, round_page(block->size), PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return false;
+ 	}
+ 	for (uint32_t off = 0; off < block->size; off += 4096) {
+@@ -845,9 +850,15 @@ space_off(struct gpu_space *space, uint32_t match)
+ #define GMU_ITCM_ADDRESS        0x00000000u
+ #define GMU_DTCM_ADDRESS        0x10004000u     /* kgsl_gmu.c gmu_vma（a650 家族）：SZ_256M + SZ_16K */
+ #define GMU_TCM_SIZE            0x4000u
+-#define GMU_LOG_ADDRESS         0x60002000u     /* 固件自己要的 0x60000000 一页之后 */
+-#define GMU_LOG_SIZE            0x4000u
+-#define GMU_HFI_ADDRESS         0x60006000u
++/*
++ * 和原厂一样的顺序（kgsl_gmu.c：先 load_firmware 的预分配 0x60000000 一页，再 gmu_memory_probe：
++ * HFI 内存 0x60001000，HFIMEM_SIZE = 表 + 16 + 4 × 4K，再日志 4K）。k10 上 HFI 放 0x60006000、
++ * 日志 16K 时 GMU 对第一条消息不回应（原因未明），所以这里照原厂的地址和大小。
++ */
++#define GMU_HFI_ADDRESS         0x60001000u
++#define GMU_HFI_SIZE            0x5000u
++#define GMU_LOG_ADDRESS         0x60006000u
++#define GMU_LOG_SIZE            0x1000u
+ #define GMU_STREAM              5u              /* 设备树 gmu_kernel iommus = <kgsl_smmu 5 0x400> */
+ 
+ struct gmu_fw_block {
+@@ -916,7 +927,7 @@ step_space(void)
+ 		}
+ 	}
+ 	if (!block_new(&gmu_space, &gmu_log, GMU_LOG_ADDRESS, GMU_LOG_SIZE) ||
+-	    !block_new(&gmu_space, &gmu_hfi, GMU_HFI_ADDRESS, PAGE_SIZE)) {
++	    !block_new(&gmu_space, &gmu_hfi, GMU_HFI_ADDRESS, GMU_HFI_SIZE)) {
+ 		return false;
+ 	}
+ 	(void)PE_parse_boot_argn("picassogmucb", &gmu_space.context, sizeof(gmu_space.context));
+@@ -1088,18 +1099,23 @@ step_start(void)
+ 		printf(TAG ": %u: the HFI page is not in one piece\n", step);
+ 		return false;
+ 	}
++	/* 照 kgsl_hfi.c hfi_init：4 个队列头都填，第 4 个（DSP 0，优先级 20）关着；num_q = num_active_q = 4 */
+ 	hfi->version = 0;
+ 	hfi->words = sizeof(struct hfi_table) / 4;
+ 	hfi->first_queue = 6;
+ 	hfi->queue_words = sizeof(struct hfi_queue) / 4;
+ 	hfi->queues = 4;
+-	hfi->active_queues = HFI_QUEUES;
+-	for (unsigned i = 0; i < HFI_QUEUES; i++) {
++	hfi->active_queues = 4;
++	for (unsigned i = 0; i < 4; i++) {
+ 		hfi->queue[i].start = GMU_HFI_ADDRESS + HFI_QUEUE_AT(i);
+-		hfi->queue[i].type = i | (uint32_t)priority[i] << 8;
++		hfi->queue[i].type = i | (uint32_t)(i < HFI_QUEUES ? priority[i] : 20) << 8;
+ 		hfi->queue[i].words = HFI_QUEUE_WORDS;
++		hfi->queue[i].message_words = 0;
++		for (unsigned u = 0; u < 5; u++) {
++			hfi->queue[i].unused[u] = 0;
++		}
+ 		hfi->queue[i].read = hfi->queue[i].write = 0;
+-		hfi->queue[i].status = 1;
++		hfi->queue[i].status = i < HFI_QUEUES;
+ 	}
+ 	settle();
+ 
+@@ -1127,7 +1143,13 @@ step_start(void)
+ 	put(&gmu, "ahb_fence_range_0", GMU_AHB_FENCE_RANGE_0, GMU_FENCE_RANGE);
+ 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
+ 	put(&gmu, "hfi_sfr_addr (chip)", GMU_HFI_SFR_ADDR, GMU_CHIP);
+-	put(&gmu, "pwr_col_cp_msg (log)", GMU_PWR_COL_CP_MSG, (GMU_LOG_ADDRESS & 0xfffff000u) | (GMU_LOG_SIZE / 4096 - 1));
++	put(&gmu, "pwr_col_cp_msg (log)", GMU_PWR_COL_CP_MSG, (GMU_LOG_ADDRESS & 0xfffff000u) | ((GMU_LOG_SIZE / 4096 - 1) & 0xff));
++	/* 原厂 gmu_start 在启动固件前先 irq_enable：清掉、只放开 HFI_IRQ_MASK（侧队列、调试队列、CM3 故障）和 AO 的三个中断。
++	 * MSGQ（位 0）本来就不放开，回应靠轮询 GMU2HOST_INTR_INFO（GIC 那边这两条 SPI 300/304/305 没打开，不会进中断） */
++	put(&gmu, "gmu2host_intr_clr", GMU_GMU2HOST_INTR_CLR, 0xffffffff);
++	put(&gmu, "ao_host_interrupt_clr", GMU_AO_HOST_INTR_CLR, 0xffffffff);
++	put(&gmu, "gmu2host_intr_mask", GMU_GMU2HOST_INTR_MASK, ~(1u << 1 | 1u << 2 | 1u << 15));
++	put(&gmu, "ao_host_interrupt_mask", GMU_AO_HOST_INTR_MASK, ~(1u << 0 | 1u << 3 | 1u << 5));
+ 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
+ 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
+ 	put(&gmu, "dcache_config", GMU_DCACHE_CONFIG, 1);
+@@ -1252,7 +1274,7 @@ gmu_post_mortem(void)
+ 	if (gmu_log.memory) {
+ 		to_memory(gmu_log.memory, GMU_LOG_SIZE);
+ 		printf(TAG ": %u: the GMU's log, %u events in, the last 32:\n", step, next);
+-		for (uint32_t i = next > 32 ? next - 32 : 0; i < next && i + 4 <= entries; i += 4) {
++		for (uint32_t i = next > 32 ? (next - 32) & ~3u : 0; i < next && i + 4 <= entries; i += 4) {
+ 			printf(TAG ": %u:   %x %x %x %x | %x %x %x %x | %x %x %x %x | %x %x %x %x\n", step,
+ 			    log[4 * i], log[4 * i + 1], log[4 * i + 2], log[4 * i + 3], log[4 * i + 4], log[4 * i + 5],
+ 			    log[4 * i + 6], log[4 * i + 7], log[4 * i + 8], log[4 * i + 9], log[4 * i + 10], log[4 * i + 11],
+@@ -1289,7 +1311,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
+ 	for (int i = 0; i < 2000 && !answered; i++) {
+ 		sleep_us(100);
+ 		waiting = rd(gmu.base + GMU_GMU2HOST_INTR_INFO);
+-		if (waiting & 1) {
++		if ((waiting & 1) || hfi->queue[1].read != hfi->queue[1].write) {
+ 			wr(gmu.base + GMU_GMU2HOST_INTR_CLR, 1);
+ 			answered = hfi_receive(1, number, &verdict);
+ 		}
+@@ -1302,6 +1324,15 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
+ 		printf(TAG ": %u: the GMU %s (%#x) to %s; fw_init_result %#x, gmu2host_intr_info %#x\n", step,
+ 		    answered ? "says no" : "does not answer", verdict, what, rd(gmu.base + GMU_CM3_FW_INIT_RESULT),
+ 		    rd(gmu.base + GMU_GMU2HOST_INTR_INFO));
++		/* k10：不知道 GMU 有没有取走消息。读指针动了 = 它读了队列；没动 = 没看见中断或读不到内存 */
++		for (unsigned i = 0; i < 4; i++) {
++			printf(TAG ": %u: hfi queue %u: status %u start %#x type %#x words %u read %u write %u\n", step, i,
++			    hfi->queue[i].status, hfi->queue[i].start, hfi->queue[i].type, hfi->queue[i].words,
++			    hfi->queue[i].read, hfi->queue[i].write);
++		}
++		printf(TAG ": %u: host2gmu raw %#x, gmu2host mask %#x, hfi_ctrl_status %#x, cm3_sysreset %#x\n", step,
++		    rd(gmu.base + GMU_HOST2GMU_INTR_RAW), rd(gmu.base + GMU_GMU2HOST_INTR_MASK),
++		    rd(gmu.base + GMU_HFI_CTRL_STATUS), rd(gmu.base + GMU_CM3_SYSRESET));
+ 		space_faulted(&gmu_space);
+ 		gmu_post_mortem();
+ 		return false;
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -317,27 +317,42 @@ void
+ SweetBattery::chargerKeep(void)
+ {
+ 	uint8_t now[sizeof(kChgRegs) / sizeof(kChgRegs[0])];
+-	bool ok = true;
++	bool ok = true;                 /* CHGR/DCDC/USBIN（前 17 个）都读到了 */
++	char failed[64] = "";
+ 	for (unsigned i = 0; i < sizeof(now); ++i) {
+ 		if (sweet_spmi_read(2, kChgRegs[i].addr, &now[i])) {
+ 			now[i] = 0xff;
+-			ok = false;
++			if (i < 17) {
++				ok = false;
++			}
++			size_t len = strlen(failed);
++			if (len + 6 < sizeof(failed)) {
++				snprintf(failed + len, sizeof(failed) - len, " %x", kChgRegs[i].addr);
++			}
+ 		}
+ 	}
+ 	if ((!fChgLogged || memcmp(now, fChgLast, sizeof(now))) && fChgLines < 60) {
+-		char line[512];
+-		int n = snprintf(line, sizeof(line), "SWEET CHARGER:%s", ok ? "" : " (some reads failed)");
+-		for (unsigned i = 0; i < sizeof(now) && n > 0 && (unsigned)n < sizeof(line); ++i) {
+-			n += snprintf(line + n, sizeof(line) - (unsigned)n, " %s=%02x", kChgRegs[i].name, now[i]);
++		/* logs/boot-k9.txt：一行超过约 256 字符被 IOLog 截掉，所以分两行，读失败的地址单独列出 */
++		char line[200];
++		for (unsigned half = 0; half < 2; ++half) {
++			unsigned from = half ? 10 : 0, to = half ? (unsigned)sizeof(now) : 10;
++			int n = snprintf(line, sizeof(line), "SWEET CHARGER %u/2:", half + 1);
++			for (unsigned i = from; i < to && n > 0 && (unsigned)n < sizeof(line); ++i) {
++				n += snprintf(line + n, sizeof(line) - (unsigned)n, " %s=%02x", kChgRegs[i].name, now[i]);
++			}
++			IOLog("%s\n", line);
++		}
++		if (failed[0]) {
++			IOLog("SWEET CHARGER: reads failed at%s\n", failed);
+ 		}
+-		IOLog("%s\n", line);
+ 		memcpy(fChgLast, now, sizeof(now));
+ 		fChgLogged = true;
+-		++fChgLines;
++		fChgLines += 2;
+ 	}
+ 	if (fCharge < 1 || !ok) {
+ 		return;
+ 	}
++	/* MISC（0x16xx）读不到时照样试着喂狗：写会被 sweet_spmi_write 的 EE 归属检查拒绝的话会打一行 */
+ 	static const uint8_t one = 1;
+ 	int err = sweet_spmi_write(2, 0x1643, &one, 1);         /* BARK_BITE_WDOG_PET */
+ 	if (err && fChgLines < 60) {
