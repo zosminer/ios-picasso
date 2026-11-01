@@ -1,0 +1,126 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5568,6 +5568,63 @@ bad:
+  * Note:	The argument and environment vectors are user space pointers
+  *		to arrays of user space pointers.
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET: boot-arg sweetinject=LIBRARY:NAME[,NAME...][;LIBRARY:NAME[,NAME...]]...
++ * -- 文件名是某个 NAME 的程序启动时，环境里多一个 DYLD_INSERT_LIBRARIES=LIBRARY（该组的库），
++ * 比如把 CoreAnimation 桥插进 backboardd。launchd 会把任务描述里的 DYLD_ 变量丢掉，所以由内核来加；
++ * dyld 肯听是因为 bsd/kern/sweet_amfi.c 的 "AMFI" 策略对它的询问一律放行。
++ * 默认没有这个 boot-arg = 什么都不插。第一个点名这个程序的组生效。
++ * 来自 ios-apollo 0114（MIT），再往前是 HackiOS 的 kern.exec_inject（bsd/kern/kern_exec.c）。
++ */
++static bool
++sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
++{
++	char conf[200];
++	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *name = path;
++	size_t namelen;
++
++	if (!PE_parse_boot_argn("sweetinject", conf, sizeof(conf)) ||
++	    strncmp(imgp->ip_strings, EXECUTABLE_KEY, strlen(EXECUTABLE_KEY)) != 0) {
++		return false;
++	}
++	for (const char *c = path; *c != 0; c++) {
++		if (*c == '/') {
++			name = c + 1;
++		}
++	}
++	namelen = strlen(name);
++	if (namelen == 0) {
++		return false;
++	}
++	for (const char *group = conf; *group != 0;) {
++		const char *lib = group, *word;
++		size_t grouplen = 0, liblen = 0;
++
++		while (group[grouplen] != 0 && group[grouplen] != ';') {
++			grouplen++;
++		}
++		while (liblen < grouplen && lib[liblen] != ':') {
++			liblen++;
++		}
++		for (word = lib + liblen + 1; liblen != 0 && liblen < grouplen && word < group + grouplen;) {
++			size_t len = 0;
++
++			while (word + len < group + grouplen && word[len] != ',') {
++				len++;
++			}
++			if (len == namelen && strncmp(word, name, len) == 0) {
++				snprintf(env, size, "DYLD_INSERT_LIBRARIES=%.*s", (int)liblen, lib);
++				return true;
++			}
++			word += len + (word + len < group + grouplen && word[len] == ',');
++		}
++		group += grouplen + (group[grouplen] == ';');
++	}
++	return false;
++}
++#endif
++
+ __attribute__((noinline))
+ static int
+ exec_extract_strings(struct image_params *imgp)
+@@ -5741,6 +5798,26 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* 要插库的程序多一个环境变量（见 sweet_exec_inject） */
++	{
++		char inject[240];
++
++		if (sweet_exec_inject(imgp, inject, sizeof(inject))) {
++			error = exec_add_user_string(imgp, CAST_USER_ADDR_T(inject), UIO_SYSSPACE, TRUE);
++			if (error) {
++				goto bad;
++			}
++			if (imgp->ip_argspace < new_ptr_size) {
++				error = E2BIG;
++				goto bad;
++			}
++			imgp->ip_argspace -= new_ptr_size;
++			imgp->ip_envc++;
++		}
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -24,6 +24,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <pexpert/pexpert.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+@@ -335,6 +336,22 @@ sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
+ 	int error;
+ 
++	if (call == 0x60) {
++		/*
++		 * amfi_interface_query_bootarg_state（ios-apollo 0124）：lsd（扩展点目录）和 installd 问
++		 * 签名保护的 /System/Library/xpc/extensions.plist 要不要检查；(state & 0x86) != 0 就不检查。
++		 * 没有真的 AMFI 时检查会失败，于是不认识任何 app 扩展（没有壁纸、小组件等）。回 0x86。
++		 * boot-arg sweetamfistate=0：回到之前的行为（成功但不写输出）。
++		 */
++		uint64_t state = 0x86;
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("sweetamfistate", &on, sizeof(on));
++		if (on && arg != 0) {
++			return copyout(&state, arg, sizeof(state));
++		}
++		return 0;
++	}
+ 	if (call != SWEET_AMFI_CHECK_DYLD_POLICY) {
+ 		static uint64_t seen;
+ 		if (call >= 0 && call < 64 && !(seen & (1ULL << call))) {
