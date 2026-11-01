@@ -1,0 +1,212 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -747,6 +747,7 @@ struct gpu_block {
+ 	vm_offset_t memory;
+ };
+ 
++static bool block_not_contiguous;       /* 第 19 步的 10 MB 画面缓冲：普通分配 */
+ static bool block_new_as(struct gpu_space *space, struct gpu_block *block, uint64_t address, uint32_t size,
+     uint64_t attributes);
+ 
+@@ -761,9 +762,14 @@ block_new_as(struct gpu_space *space, struct gpu_block *block, uint64_t address,
+ {
+ 	block->address = address;
+ 	block->size = (size + 4095) & ~4095u;
+-	/* 物理连续（sweet_ufs.c 的 DMA 内存同样做法）：HFI 页要第二个不缓存映射，固件块整块刷缓存也简单 */
+-	if (kmem_alloc_contig(kernel_map, &block->memory, round_page(block->size), PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	/* 物理连续（sweet_ufs.c 的 DMA 内存同样做法）：HFI 页要第二个不缓存映射，固件块整块刷缓存也简单。
++	 * 画面缓冲 10 MB 不要求连续（SMMU 一页一页映射），用普通分配。 */
++	kern_return_t kr = block_not_contiguous ?
++	    kmem_alloc(kernel_map, &block->memory, round_page(block->size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) :
++	    kmem_alloc_contig(kernel_map, &block->memory, round_page(block->size), PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS) {
+ 		return false;
+ 	}
+ 	for (uint32_t off = 0; off < block->size; off += 4096) {
+@@ -2002,6 +2008,175 @@ step_core_commands(void)
+ 	return scratch[0] == 0x600dc0de;
+ }
+ 
++/* ---------------------------------------------------------------- 19. GPU 画一张图 */
++
++/*
++ * 3D 核心的 2D 引擎往我们的内存里填三条色带（橙、白、蓝，自上而下），刷出缓存，CPU 读回核对，
++ * 再抄到面板的帧缓冲上留几秒让用户看见。寄存器和顺序照 Mesa fd6_blitter.cc fd6_clear_surface，
++ * 抄法照 HackiOS 第 22 步和 ios-apollo 补丁 0110（Adreno 650 上屏幕真的出了色带）。
++ * 和 650 唯一的区别：RB_CCU_CNTL。650 的 num_ccu 是 3（color offset 3 × 64 KiB = 0x18000000），
++ * 620 在 Mesa 里是 1（1 × 64 KiB = 0x08000000）。picassoccu=0x... 可以改。
++ */
++#define CP_WAIT_FOR_IDLE        0x26
++#define CP_BLIT                 0x2c
++#define CP_EVENT_WRITE          0x46
++#define CP_SET_MARKER           0x65
++#define RM6_BLIT2DSCALE         12
++#define EVENT_FLUSH_COLOR_TS    0x1d
++#define EVENT_CACHE_FLUSH_TS    0x04
++#define REG_GRAS_2D_BLIT_CNTL   0x8400
++#define REG_GRAS_2D_DST_TL      0x8405
++#define REG_GRAS_2D_DST_BR      0x8406
++#define REG_RB_2D_BLIT_CNTL     0x8c00
++#define REG_RB_2D_PIXEL_CNTL    0x8c01
++#define REG_RB_2D_DST_INFO      0x8c17
++#define REG_RB_2D_DST           0x8c18
++#define REG_RB_2D_DST_PITCH     0x8c1a
++#define REG_RB_2D_SOLID_C0      0x8c2c
++#define REG_RB_CCU_CNTL         0x8e07
++#define REG_SP_2D_DST_FORMAT    0xacc0
++#define FMT6_8_8_8_8_UNORM      0x30u
++#define BLIT_SOLID_8888         (1u << 7 | FMT6_8_8_8_8_UNORM << 8 | 0xfu << 20 | 0x10u << 24)
++#define DST_BGRA_LINEAR         (FMT6_8_8_8_8_UNORM | 1u << 10)
++#define CCU_CNTL_BYPASS_A620    0x08000000u
++#define CORE_TARGET_ADDRESS     0x10000000u
++#define TARGET_W                1080u
++#define TARGET_H                2400u
++#define TARGET_ROW              4352u           /* 1088 个像素：2D 引擎的行距以 64 字节为单位 */
++#define PANEL_FB_PA             0xa0000000u     /* 日志：AppleCLCD 1080x2400 stride 4320 at 0xa0000000 */
++#define PANEL_ROW               (TARGET_W * 4u)
++
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
++static void
++ring_fill(uint32_t top, uint32_t bottom, uint32_t red, uint32_t green, uint32_t blue)
++{
++	ring_register(REG_GRAS_2D_DST_TL, top << 16);
++	ring_register(REG_GRAS_2D_DST_BR, (TARGET_W - 1) | (bottom - 1) << 16);
++	ring_register(REG_RB_2D_SOLID_C0, red);
++	ring_register(REG_RB_2D_SOLID_C0 + 1, green);
++	ring_register(REG_RB_2D_SOLID_C0 + 2, blue);
++	ring_register(REG_RB_2D_SOLID_C0 + 3, 255);
++	ring_register(REG_RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_register(REG_SP_2D_DST_FORMAT, 1 | FMT6_8_8_8_8_UNORM << 3 | 0xfu << 12);
++	ring_register(REG_RB_2D_PIXEL_CNTL, 0);
++	ring_register(REG_RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_register(REG_RB_2D_DST, CORE_TARGET_ADDRESS);
++	ring_register(REG_RB_2D_DST + 1, 0);
++	ring_register(REG_RB_2D_DST_PITCH, TARGET_ROW >> 6);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	ring_command(CP_BLIT, 1);
++	ring(3);                                /* 2D 引擎唯一的操作 "scale" */
++}
++
++/* 往已经开着的上下文里加了页：表刷出缓存，TLB 忘掉旧的 */
++static void
++space_refresh(struct gpu_space *space)
++{
++	uint32_t cb = smmu_context(space);
++	for (uint32_t i = 0; i < space->table_count; i++) {
++		to_memory((vm_offset_t)space->tables[i].table, 4096);
++	}
++	put(&smmu, "cb tlbiasid", cb + SMMU_CB_TLBIASID, space->context);
++	put(&smmu, "cb tlbsync", cb + SMMU_CB_TLBSYNC, 1);
++	(void)wait_for(&smmu, cb + SMMU_CB_TLBSTATUS, 1, 0, 100);
++}
++
++static struct gpu_block core_target;
++
++static bool
++step_frame(void)
++{
++	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch.memory;
++	uint32_t ccu = CCU_CNTL_BYPASS_A620, show_seconds = 6;
++	if (!cx_ready() || !core_runs || !core_space_is_on) {
++		return false;
++	}
++	(void)PE_parse_boot_argn("picassoccu", &ccu, sizeof(ccu));
++	(void)PE_parse_boot_argn("picassogpushow", &show_seconds, sizeof(show_seconds));
++	if (show_seconds > 60) {
++		show_seconds = 60;
++	}
++	if (!zap_is_loaded && !no_zap) {
++		printf(TAG ": %u: the 3D core is not out of secure mode\n", step);
++		return false;
++	}
++	announce("make a picture's worth of memory for the 3D core (1080x2400, 10 MB) and have its 2D engine fill three bands");
++	block_not_contiguous = true;
++	bool made = block_new_as(&core_space, &core_target, CORE_TARGET_ADDRESS, TARGET_ROW * TARGET_H, PTE_CORE);
++	block_not_contiguous = false;
++	if (!made) {
++		printf(TAG ": %u: no memory for the picture\n", step);
++		return false;
++	}
++	space_refresh(&core_space);
++	bzero((void *)scratch, 64);
++	to_memory(core_scratch.memory, 64);
++	ring_command(CP_SET_MARKER, 1);
++	ring(RM6_BLIT2DSCALE);
++	ring_register(REG_RB_CCU_CNTL, ccu);
++	ring_fill(0, 800, 255, 128, 0);                 /* 橙 */
++	ring_fill(800, 1600, 255, 255, 255);            /* 白 */
++	ring_fill(1600, TARGET_H, 0, 128, 255);         /* 蓝 */
++	/* 出缓存进内存；每个事件做完在后面的地址写一个字（Linux a6xx_submit） */
++	ring_command(CP_EVENT_WRITE, 4);
++	ring(EVENT_FLUSH_COLOR_TS);
++	ring(CORE_SCRATCH_ADDRESS + 32);
++	ring(0);
++	ring(0x0c0c0c0c);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring(EVENT_CACHE_FLUSH_TS);
++	ring(CORE_SCRATCH_ADDRESS + 16);
++	ring(0);
++	ring(0x0d0e0d0e);
++	ring_command(CP_WAIT_FOR_IDLE, 0);
++	if (!ring_run("fill a picture")) {
++		return false;
++	}
++	to_memory(core_scratch.memory, 64);
++	printf(TAG ": %u: the words it writes when its caches are in memory: %#x, %#x (told 0xc0c0c0c, 0xd0e0d0e)\n", step,
++	    scratch[8], scratch[4]);
++	to_memory(core_target.memory, core_target.size);
++	const volatile uint8_t *px = (const volatile uint8_t *)core_target.memory;
++	const uint32_t mid = 1200u * TARGET_ROW + 540u * 4u, last = 2399u * TARGET_ROW + 1079u * 4u;
++	printf(TAG ": %u: pixels (b g r a): first %02x %02x %02x %02x (told 00 80 ff ff), middle %02x %02x %02x %02x "
++	    "(ff ff ff ff), last %02x %02x %02x %02x (ff 80 00 ff)\n", step, px[0], px[1], px[2], px[3], px[mid], px[mid + 1],
++	    px[mid + 2], px[mid + 3], px[last], px[last + 1], px[last + 2], px[last + 3]);
++	if (px[2] != 0xff || px[1] != 0x80 || px[0] != 0 || px[mid] != 0xff || px[mid + 2] != 0xff || px[last] != 0xff ||
++	    px[last + 2] != 0) {
++		printf(TAG ": %u: the picture is not what the 3D core was told to draw (try picassoccu=0x18000000 or 0x10000004)\n",
++		    step);
++		return false;
++	}
++	printf(TAG ": %u: THE GPU HAS DRAWN A PICTURE\n", step);
++	/* 抄到面板的帧缓冲；iOS 的显示驱动会周期性重画，所以每 50 ms 抄一次，持续几秒让人看见 */
++	vm_offset_t fb = ml_io_map_wcomb(PANEL_FB_PA, round_page(PANEL_ROW * TARGET_H));
++	if (fb == 0) {
++		printf(TAG ": %u: the panel's framebuffer cannot be mapped\n", step);
++		return true;
++	}
++	for (uint32_t frame = 0; frame < show_seconds * 20; frame++) {
++		for (uint32_t y = 0; y < TARGET_H; y++) {
++			const volatile uint32_t *src = (const volatile uint32_t *)(core_target.memory + y * TARGET_ROW);
++			volatile uint32_t *dst = (volatile uint32_t *)(fb + y * PANEL_ROW);
++			for (uint32_t x = 0; x < TARGET_W; x++) {
++				dst[x] = src[x];
++			}
++		}
++		settle();
++		sleep_ms(50);
++	}
++	printf(TAG ": %u: A PICTURE DRAWN BY THE GPU WAS ON THE PANEL for %u s: orange, white, blue from the top\n", step,
++	    show_seconds);
++	return true;
++}
++
+ /* ---------------------------------------------------------------- 撤回 */
+ 
+ static void
+@@ -2104,6 +2279,7 @@ gpu_block_stop(void)
+ static bool(*const steps[])(void) = {
+ 	step_cx, step_words, step_rscc, step_smmu, step_tcm, step_cmd_db, step_space, step_rpmh, step_load,
+ 	step_start, step_hfi, step_tables, step_gx, step_tz, step_core_space, step_core_start, step_zap, step_core_commands,
++	step_frame,
+ };
+ #define STEPS ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
+ 
