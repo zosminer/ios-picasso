@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/picasso_adreno.c
-@@ -0,0 +1,1552 @@
+@@ -0,0 +1,1553 @@
 +/*
 + * picasso（红米 K30 5G，SM7250 "lito"）Adreno 620：GMU 固件启动到 GX（3D 核心）上电。
 + * boot-arg picassogpu=3 时由 bsd/dev/picasso_gpu.c 的线程调用 picasso_adreno_run()。
@@ -57,6 +57,7 @@
 +#include <libkern/libkern.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern uint64_t mach_absolute_time(void);
 +extern void absolutetime_to_nanoseconds(uint64_t abstime, uint64_t *result);

@@ -232,7 +232,18 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **成功**（Xcode 16.0 / 16A242d，9 分半，只跳过 4 个 dxb 补丁），内核 17320240 字节，产物 `xnu/out-0100/`，含 0098/0099 字符串。
   上机通过后把 xnu.yml 默认 runner 改成 macos-15。
 - **k9**（sha256 9c561800…）= Xcode 16 内核（0098+0099+0100）+ k5 命令行（不带 GPU 参数，单测充电和新工具链）。
-  用户说 6% 电量够用，2026-11-01 00:00 UTC fastboot boot OKAY。
+  用户说 6% 电量够用，2026-11-01 00:00 UTC fastboot boot OKAY。用户随后说"gpu 是主要的 先搞 gpu"（k9 结果未报）。
+- **0101 Adreno 620 GMU 启动到 GX 上电**（`bsd/dev/picasso_adreno.c`，`picassogpu=3` 进入，`picassoadreno=N` 做到第 N 步）：
+  HackiOS redwood_adreno.c 的步骤 4-17 的移植（APSL），数值全部按小米 picasso-r-oss 的 drivers/gpu/msm
+  （已下载到 `src/.scratch/lito-ref/kgsl/`，不入库）：a620 = a650 家族、a650_gmu.bin、gmu_major 2、veto_fal10、
+  **没有 pdc_in_aop → PDC 微码和 TCS1/TCS3 也由我们写**（mx/cx/xo + vrm.soc+4），RSC hidden_tcs2 = 0x80000000，
+  chip 0x06020100，GMU VMA：ITCM 0、DTCM 0x10004000、非缓存 0x60000000；SMMU 0x10000 大小，GMU 流 5 掩码 0x400，
+  上下文 1 / SMR 1（`picassogmucb`/`picassogmusmr` 可改）；频率 275/400/500 MHz（gpu-opp-table 64/128/192），默认 400。
+  固件 a650_gmu.bin（41548 字节，块：需要内存 0x4000+0x8000、0x144000+0x13000、0x157000+0x9000、0x60000000+0x1000）
+  从 ADT `/picasso-gpu` 取：`tools/mkadt.py` 现在把 research/picasso-gpu-fw/ 的 6 个文件放进去（ADT 519996 字节）。
+  13 步：CX → 读 GMU/GBIF → 读 RSCC → 读 SMMU → DTCM 测试 → cmd-db → GMU 内存 + SMMU 上下文 → RSC/PDC 微码 →
+  固件 → 放开 CM3（等 0x100）→ HFI → 表 + CORE_FW_START + 投票 → OOB GPU、START、读 RBBM。结束后全部撤回（CX 关）。
+  只编译检查（SDK 头缺私有接口），交 CI：push run 41255719440（macos-14）+ dispatch 41255730512（macos-15）。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
