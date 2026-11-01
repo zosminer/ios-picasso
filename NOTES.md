@@ -28,6 +28,17 @@
 - **已完成（2026-11-01 22:50，用户批准）**：从新机只读备份 `modem`（320 MiB，sde48）和 `bluetooth`（1 MiB，sde33）到 `backup/new-k30/`，SHA-256 与手机一致。
   用 ios-apollo 的 `tools/fatcopy.py` 免挂载取出固件到 `backup/new-k30/fw/`（不入库）：`modem.mdt` + `modem.b00..b34`、`wlanmdsp.mbn`（3871128 字节）、
   `bdf_g7a.bin`/`bdf_g7ac.bin`（picasso 的板级数据，推测）、`bdwlan.*`、`regdb.bin`。
+- **找到开源方案（2026-11-01 夜，GitHub 搜索，已核对）——计划改了，不在内核里写基带驱动**：
+  - **github.com/NWylynko/ios-flame**（Pixel 4，SM8150，**同为 WCN3990**，MIT，本机副本 `../.scratch/github-refs/ios-flame/`）：Wi-Fi 已能用（扫描、WPA2、开机自动入网、设置里的 Wi-Fi 页、wifid + iOS 自己的 DHCP）。
+    做法：**用户态 `wland`**（`phone/wifi/`，约 5900 行：smem/SMP2P/boot_modem/GLINK/QRTR/QMI/rmtfs/pd-mapper/TFTP/WLFW/ath10k 复制引擎+WMI）经 **`/dev/pmem`** 驱动射频；
+    内核只要 0094（`sweet_pmem.c`：物理页分配/映射/SMC/ioctl）、0102（`PMEM_RPMH`，通用 RPMh 投票）、0123（en0 + Apple80211，让 wifid 工作）。其 HANDOFF.md 第 605 行起逐条记了坑
+    （SMP2P 出项要在基带启动前存在、必须有 rmtfs、MSA 内存不能收回、WLAN 电源和 QDSS 时钟等）。
+  - 其它：Bergamota（Poco F1，WCN3990，`../.scratch/github-refs/bergamota/`）、HackiOS、ios-topaz（radio.c 的来源）。
+  - **要改的地方**：flame 的基带固件文件名/PAS id/SMEM 地址/RPMh 资源名要换成 picasso 的（PAS 4、modem.mdt、bdf_g7a.bin 等）；flame 的 WLAN 电源轨名称要用 picasso 设备树核对。**这些都是推测，要上机验证。**
+  - 阶段重排：A) 补 `sweet_pmem`（0094）+ `PMEM_RPMH`（0102）+ 编译；B) 把 `wland` 适配到 picasso，先到“WLFW 服务出现”；C) 复制引擎+WMI 扫描；D) 0123 的 en0。
+- **新机首次启动慢的根因（已有旁证，待验证）**：设备树 `/chosen` 缺 `mac-address-wifi0`。Poco F1（Bergamota NOTES.md 第 322 行）和 flame 都遇到并修了同样的症状：MobileGestalt 每问一次 Wi-Fi 地址就等一个永远不出现的网络控制器，
+  lsd 首次建库要问很多次。我们的 ADT 确实没有这个属性（已核对）。已在 `tools/mkadt.py` 的 `/chosen` 加了 `mac-address-wifi0/bluetooth0/ethernet0`（locally administered，02:50:49:43:41:01..03），
+  k31（`shim/out/shim-boot-k31.img`，命令行同 k29，ADT 同 k29 加三个地址）。**验证需要全新的 LaunchServices 库，即重写 userdata**。
 - **基带固件（已观测）**：Hexagon（ELF machine 164），35 个程序段，物理地址 0x8c000000–0x9b803000（约 248 MiB），入口 0x8c000000。
   设备树 `qcom,mss@4080000`：`qcom,pil-tz-generic`、PAS id 4、memory-region = 0x8c000000+0xf800000（与固件范围吻合）、**不是 MBA 流程**；
   需要 vdd_cx/vdd_mss、XO 时钟、总线投票、AOP 邮箱（`qcom,signal-aop`）、5 个中断（wdog/err-fatal/err-ready/proxy-unvote/stop-ack/shutdown-ack）、smem-id 0x1a5。

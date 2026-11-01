@@ -238,6 +238,15 @@ def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR, gpu_fw
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # MobileGestalt's Wi-Fi/Bluetooth/Ethernet addresses. Without them every
+        # WifiAddress answer waits for an IONetworkController that never comes
+        # (once per question), so lsd's first-boot LaunchServices seed takes
+        # ~15 minutes (observed on the second K30: SpringBoard in LSContextInit,
+        # lsd in MobileGestalt's semaphore). Same fix and cause as ios-flame
+        # and the Poco F1 port. Locally administered, not the phone's own.
+        ('mac-address-wifi0', bytes([0x02, 0x50, 0x49, 0x43, 0x41, 0x01])),
+        ('mac-address-bluetooth0', bytes([0x02, 0x50, 0x49, 0x43, 0x41, 0x02])),
+        ('mac-address-ethernet0', bytes([0x02, 0x50, 0x49, 0x43, 0x41, 0x03])),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
