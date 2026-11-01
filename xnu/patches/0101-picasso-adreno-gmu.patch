@@ -10,7 +10,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/picasso_adreno.c
-@@ -0,0 +1,1553 @@
+@@ -0,0 +1,1554 @@
 +/*
 + * picasso（红米 K30 5G，SM7250 "lito"）Adreno 620：GMU 固件启动到 GX（3D 核心）上电。
 + * boot-arg picassogpu=3 时由 bsd/dev/picasso_gpu.c 的线程调用 picasso_adreno_run()。
@@ -129,7 +129,8 @@
 +static void
 +hold(bool single)
 +{
-+	if (step == newest_step && pause_ms && !single) {
++	/* 每一步宣布之后都等（不只是最新的一步）：真机上一次跑完全部步骤，哪一步出事日志都已落盘 */
++	if (step <= newest_step && pause_ms && !single) {
 +		sleep_ms(pause_ms);
 +	}
 +}
