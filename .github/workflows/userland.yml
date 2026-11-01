@@ -1,0 +1,79 @@
+name: userland
+
+# iOS arm64 programs for the phone, built with Xcode's iPhoneOS SDK and
+# ad-hoc signed. Artifact: sweet-userland (see userland/README.md):
+#   sweet-gpu-test, sweet-gl-test, lib/libOSMesa.8.dylib,
+#   lib/libsweet-gl.dylib + lib/libsweet-ca.dylib (the CoreAnimation bridge),
+#   lib/libsweet-fix.dylib (run-time fixes, xnu 0162), SHA256SUMS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - "!userland/README.md"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sweet-gpu-test
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -framework IOKit \
+            -o out/sweet-gpu-test userland/gpu-test/sweet-gpu-test.c
+          codesign -s - -f out/sweet-gpu-test
+          file out/sweet-gpu-test
+      - name: Build Mesa (libOSMesa.8.dylib, freedreno + softpipe)
+        run: |
+          set -eux
+          brew install bison
+          userland/mesa/build.sh out
+      - name: Build sweet-gl-test
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -framework IOKit \
+            -o out/sweet-gl-test userland/gl-test/sweet-gl-test.c out/lib/libOSMesa.8.dylib
+          codesign -s - -f out/sweet-gl-test
+          file out/sweet-gl-test
+          otool -L out/sweet-gl-test
+      - name: Build the CoreAnimation bridge (libsweet-gl.dylib, libsweet-ca.dylib)
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CC="xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $SDK"
+          mkdir -p build-ca
+          python3 userland/ca-bridge/mkeagl.py userland/ca-bridge/eagl_slots.txt mesa-work/meta/gl.xml \
+            mesa-work/meta/exported-gl.txt userland/ca-bridge/eagl.c > build-ca/eagl_gen.h
+          $CC -O1 -Wall -dynamiclib -install_name /usr/local/lib/libsweet-gl.dylib -Ibuild-ca -Iuserland/ca-bridge \
+            -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc out/lib/libOSMesa.8.dylib \
+            -o out/lib/libsweet-gl.dylib userland/ca-bridge/eagl.c userland/ca-bridge/sweet_gl_osmesa.c
+          $CC -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
+            -framework IOKit -o out/lib/libsweet-ca.dylib userland/ca-bridge/sweet_ca.c
+          codesign -s - -f out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
+          otool -L out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
+          nm -u out/lib/libsweet-gl.dylib | grep -c '_gl' || true
+      - name: Build libsweet-fix.dylib (run-time fixes the kernel inserts, xnu 0162)
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-fix.dylib \
+            -framework CoreFoundation -framework Foundation -framework Metal -lobjc -o out/lib/libsweet-fix.dylib userland/fix/sweet_fix.c
+          codesign -s - -f out/lib/libsweet-fix.dylib
+          otool -L out/lib/libsweet-fix.dylib
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-userland
+          path: out/
