@@ -329,6 +329,26 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   这证明 3D 核心的 2D 引擎经 SMMU 往我们的内存写了 1080x2400 的像素，缓存刷出后 CPU 读到的和屏幕显示的一致。
   （日志里的像素核对行和 "A PICTURE DRAWN BY THE GPU WAS ON THE PANEL" 还没拉，用户没进 fastboot；照片已足够证明。）
   到这里和 ios-apollo 的 boot 26 同一进度。**下一步是第 2 步：GPU 保持开启 + 服务，然后第 3 步 Mesa + CoreAnimation 桥。**
+- **第 2、3 步进行中（2026-11-01 下午，用户要求"两个一起做"）**：全部移植自 ios-apollo（MIT），已克隆在 `src/.scratch/github-refs/ios-apollo/`。
+  **内核三个补丁**（CI 41270305264，macos-15）：
+  - **0108** GPU 常开：`picasso_adreno.c` 加了 `sweet_gpu_*` 接口（地址分配器 0x20000000+0xe0000000、map/unmap、submit、done、report、recover），
+    `picassogpukeep=1` 且第 18 步（出安全模式 + 写内存）通过后不撤回，自检一次提交（往草稿页 +0x80 写 0x5eed600d），再 `SweetGPUStart()`。
+    GET_PARAM 全按 A620：GPU_ID 620、CHIP_ID 0x06020001、GMEM 0x80000、HIGHEST_BANK_BIT 14、UBWC_SWIZZLE 6、MACROTILE 1。
+    新文件 `iokit/Kernel/arm/SweetGPU.cpp`（IOService "SweetGPU" + SweetGPUUserClient，msm 选择子 0x40.. + 0x7e 的 IOSurface 缓冲）；
+    `SweetFramebuffer.cpp` 的 `present()` 改为返回 bool：某个图层的表面 GPU 还没画完就不显示、下个 tick 再来（`sweet_gpu_surface_ready`）；
+    挂起恢复 `sweet_gpu_recover()`（ios-apollo 0163；`core_hw_regs()` 是第 16 步寄存器写入的安静副本，**改一处要改两处**）。
+  - **0109** pmap：`pmap_sync_page_attributes_phys` 用 `ptoa(pp)`（32 位移位会丢掉 4 GiB 以上地址的高位 → "illegal PA" panic；我们的内核内存在 0x140000000 以上）。
+  - **0110** `sweetinject=LIB:NAME[,NAME];...`：kern_exec.c 的 `sweet_exec_inject` 给点名的程序加 DYLD_INSERT_LIBRARIES；
+    我们的 AMFI 策略本来就对 dyld 的 0x5a 询问一律放行，不用另加。`sweet_amfi.c` 加了 syscall 0x60 回 0x86（`sweetamfistate=0` 关掉）。**默认没有 sweetinject = 什么都不插，行为和现在一样。**
+  **用户态**（`userland/`，CI `.github/workflows/userland.yml`，artifact `sweet-userland`）：整套复制 ios-apollo 的 mesa（Mesa 25.0.7 freedreno + 假 libdrm sweet-drm）、
+  ca-bridge（libsweet-gl = HackiOS eagl.c，libsweet-ca = 注入 backboardd 的入口）、fix、gl-test、gpu-test；去掉 jb 安装器；`sweet_drm.c` 的描述改成 "Adreno 620 on picasso"。
+  Mesa 构建选项 `-Dgallium-drivers=softpipe,freedreno` 覆盖 A6xx 全家（含 A620），不用特别处理。
+  **库怎么进手机**：Lima 里 `~/iosroot/ios16-root.img`（16 GiB HFS+，带 cleanbase）还在，磁盘 43 GB 空闲；挂载后把 `sweet-userland/lib/*` 放进 `/usr/local/lib`、
+  程序放 `/usr/local/bin`（`sweet-gpu-test`、`sweet-gl-test` 各配一个 launchd 任务），转稀疏镜像后 `fastboot flash userdata`（约 305 秒，会清掉手机上现有的 iOS 数据）。
+  **安全开关**：库不在根里时 `sweetinject=...libsweet-ca.dylib:backboardd` 会让 backboardd 起不来（dyld 找不到被插的库就中止进程）→ 屏幕黑；去掉该 boot-arg 即恢复。所以先装库、再启用 sweetinject。
+  **验证顺序**：(1) `picassogpu=3 picassogpukeep=1`：日志要有 `THE GPU IS KEPT ON`、`self-test ... SUBMISSIONS AND FENCES WORK`、`SweetGPU: registered`；
+  (2) 根里放 sweet-gpu-test，`sweetnull=sweet-gpu-test` 看它能打开服务、提交 64 个命令缓冲；(3) sweet-gl-test：Mesa 在 GPU 上画三角形（GL_RENDERER 应是 FD620）；
+  (4) 加 `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd sweetnull=backboardd` 看桌面。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
