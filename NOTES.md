@@ -25,6 +25,13 @@
   3. WCN3990 的 CE/HTC/WMI/HTT：把 Linux ath10k（snoc 后端）用 LinuxKPI 编进内核。
   4. iOS 一侧：en0 + Apple80211 ioctl（扫描、关联、WPA）。
 - 风险：每一阶段都要靠上机验证；阶段 1 需要读 `modem` 分区（只读）。
+- **已完成（2026-11-01 22:50，用户批准）**：从新机只读备份 `modem`（320 MiB，sde48）和 `bluetooth`（1 MiB，sde33）到 `backup/new-k30/`，SHA-256 与手机一致。
+  用 ios-apollo 的 `tools/fatcopy.py` 免挂载取出固件到 `backup/new-k30/fw/`（不入库）：`modem.mdt` + `modem.b00..b34`、`wlanmdsp.mbn`（3871128 字节）、
+  `bdf_g7a.bin`/`bdf_g7ac.bin`（picasso 的板级数据，推测）、`bdwlan.*`、`regdb.bin`。
+- **基带固件（已观测）**：Hexagon（ELF machine 164），35 个程序段，物理地址 0x8c000000–0x9b803000（约 248 MiB），入口 0x8c000000。
+  设备树 `qcom,mss@4080000`：`qcom,pil-tz-generic`、PAS id 4、memory-region = 0x8c000000+0xf800000（与固件范围吻合）、**不是 MBA 流程**；
+  需要 vdd_cx/vdd_mss、XO 时钟、总线投票、AOP 邮箱（`qcom,signal-aop`）、5 个中断（wdog/err-fatal/err-ready/proxy-unvote/stop-ack/shutdown-ack）、smem-id 0x1a5。
+- **我们内核已有**：SCM 的 PAS init/auth_and_reset（0103/0105，GPU zap 用，PAS 13）、RPMh、部分 AOP。**没有**：SMEM、SMP2P、GLINK、QRTR、基带电源/时钟/总线投票、AOP 邮箱发信、基带中断。→ 阶段 1 比预想大。
 
 ## picasso（红米 K30 5G，SM7250）移植：交接记录（2026-10-22，最先阅读）
 
