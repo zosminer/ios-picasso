@@ -378,6 +378,15 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   库不在 / 没等到 GPU / `sweetgl=0` 都**退回软件渲染而不是崩**；成功会打 `sweet-ca: SweetGPU is there (waited X s): loading /usr/local/lib/libsweet-gl.dylib`，之后 libsweet-gl 打 `sweet-gl:` 行（每帧统计等）。
   **回退**：去掉 `sweetinject=`（或加 `sweetgl=0`）就回到软件渲染桌面。**唯一会让 backboardd 起不来的情况**：参数里点名的库文件在镜像里缺失（dyld 找不到被插入的库就中止进程）——库已在镜像里，已核对大小。
   日志要看的：`sweet-ca:` / `sweet-gl:` 行、有没有 backboardd CRASH、屏幕是否正常、`SweetGPU: submission N` 的计数是否持续增长（= 桌面真的在往 GPU 提交）。
+- **k20 结果（14:01 启动，用户拍照）：backboardd（pid 56）内核 panic**：
+  `panic(cpu 1 caller 0xfffffe0007b53e90): IOGMD: not wired for the IODMACommand @IOMemoryDescriptor.cpp:3248`。日志 `logs/boot-k20.txt` 还没拉（手机停在 panic 屏，要用户进 fastboot 后再经 recovery 拉）。
+  **原因（读代码得出，尚未用日志证实）**：`SweetGPUUserClient::surfaceBuffer()` → `newBuffer()` → `memory->getPhysicalSegment(..., kIOMemoryMapperNone)`，
+  而 IOSurface 的内存按 0096 是 `kIOMemoryPageable|kIOMemoryPurgeable`（`SweetSurface.cpp` ≈826 行），没锁页，getPhysicalSegment 对未 wire 的可换出内存直接 panic。
+  `gemNew` 的缓冲不是可换出的，不受影响。好消息：说明 libsweet-ca/libsweet-gl 已经注入 backboardd 并走到了"把桌面表面交给 GPU"这一步。
+- **0111（修复，已提交，待 CI 与上机）**：`surfaceBuffer()` 在 `newBuffer` 之前 `sweet_surface_pin(s)`（保持非易失，已被清空就返回 NotReady）+ `s->memory->prepare()`（把页锁进内存）；
+  `newBuffer` 失败就 `complete()`+`unpin`；`freeBuffer()` 真正释放时（GPU 已不用）配对 `complete()`+`unpin`。GPU 还没停的缓冲维持原来的"永远归 GPU"，不解锁。
+  **k21 = k20 的命令行 + 0111 内核**。验证看：`sweet-ca: SweetGPU is there (waited X s): loading /usr/local/lib/libsweet-gl.dylib`、无 backboardd panic、`SweetGPU: submission N` 持续增长。
+  还没做（疑似需要）：ios-apollo 的 0115（planar 表面）、0116（拒绝 wrap）、0117（creator 内存）还没读也没移植；若 k21 又在表面类型上出问题先看这三个。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、

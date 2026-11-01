@@ -1,0 +1,41 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -353,6 +353,10 @@ SweetGPUUserClient::freeBuffer(struct gpu_buffer *b)
+ 	} else {
+ 		sweet_gpu_unmap(b->address, b->size);
+ 		sweet_gpu_address_free(b->address, b->size);
++		if (b->surface != NULL) {
++			b->memory->complete();          /* 配对 surfaceBuffer 里的 prepare() 和钉住（0111） */
++			sweet_surface_unpin(b->surface);
++		}
+ 		b->memory->release();
+ 		OSSafeReleaseNULL(b->surface);
+ 	}
+@@ -510,8 +514,27 @@ SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *request)
+ 	if (b != NULL) {
+ 		s->release();                   /* (the buffer holds it already) */
+ 	} else {
++		/*
++		 * picasso 0111：表面内存是可换出、可清空的（0096）。GPU 要的是稳定的物理页，
++		 * 所以先钉住（保持非易失，已被清空就不给），再 prepare() 把页锁进内存；
++		 * 否则 getPhysicalSegment 会在 IOMemoryDescriptor.cpp 里 panic "not wired for the IODMACommand"。
++		 * 两者都在缓冲释放时归还（freeBuffer）。
++		 */
++		if (!sweet_surface_pin(s)) {
++			IOLockUnlock(gGPULock);
++			s->release();
++			return kIOReturnNotReady;
++		}
++		if (s->memory->prepare() != kIOReturnSuccess) {
++			sweet_surface_unpin(s);
++			IOLockUnlock(gGPULock);
++			s->release();
++			return kIOReturnVMError;
++		}
+ 		s->memory->retain();
+ 		if ((b = newBuffer(s->memory, size, 0, &request->handle)) == NULL) {
++			s->memory->complete();
++			sweet_surface_unpin(s);
+ 			s->memory->release();
+ 			s->release();
+ 		} else {
