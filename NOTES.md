@@ -265,6 +265,15 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   失败时打印 4 个队列头的读写指针、HOST2GMU raw、掩码；SMMU 全局故障（SGFSR/GFAR/GFSYNR，未匹配的流比如 4）也打印；
   回应同时看队列 1 的指针。充电器日志拆两行并列出读失败的地址，MISC 读失败时仍然喂狗。CI 41258318187（macos-15）成功。
 - **k11**（sha256 55ba5c2b…）= 0102 内核 + picasso-gpu.adt + k10 的命令行；从 OrangeFox `adb reboot bootloader` 后 fastboot boot OKAY。
+- **🎉 k11 结果（`logs/boot-k11.txt`）：13 步全部成功，GX（3D 核心）第一次上电并回应。**
+  0102 的原厂 HFI 布局（0x60001000/0x5000，日志 0x60006000）+ 中断掩码之后：性能表、带宽表、CORE_FW_START、
+  频率投票（400 MHz）全部被 GMU 接受；OOB GPU 批准；HFI START 接受；RBBM_STATUS 0x1、RBBM_INT_0_STATUS 0、
+  RBBM_CLOCK_CNTL 0、CP_RB_BASE 0。撤回时 PREPARE_SLUMBER 被接受。没有 SMMU 上下文/全局故障。
+  所以 k10 失败的原因是 HFI/日志地址或者中断掩码（两个一起改的，没分开验证）。
+  充电：chg_st1 在 03/04 之间（FULLON/TAPER，在充），MISC 0x1606/0x1651/0x1653 读不到（推测 MISC 外设不归 EE0，看门狗喂不到），
+  但整次没停充；OrangeFox 里 93%。SpringBoard 开机早期 sig 11 崩一次后重启（GPU 步骤之前，无关）。
+- **下一步（用户已批准，2026-11-01）：0103 = HackiOS 步骤 11/12/18-21**：TrustZone SCM 询问、zap 签名（PAS 13，a620_zap.mdt）、
+  zap 加载（auth_and_reset）、3D 核心的 SMMU 上下文 0（流 0/1）+ ring + a650_sqe.fw、CP 启动、ME_INIT、出安全模式、CP_MEM_WRITE 测试。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
