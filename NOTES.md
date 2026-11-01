@@ -387,6 +387,13 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `newBuffer` 失败就 `complete()`+`unpin`；`freeBuffer()` 真正释放时（GPU 已不用）配对 `complete()`+`unpin`。GPU 还没停的缓冲维持原来的"永远归 GPU"，不解锁。
   **k21 = k20 的命令行 + 0111 内核**。验证看：`sweet-ca: SweetGPU is there (waited X s): loading /usr/local/lib/libsweet-gl.dylib`、无 backboardd panic、`SweetGPU: submission N` 持续增长。
   还没做（疑似需要）：ios-apollo 的 0115（planar 表面）、0116（拒绝 wrap）、0117（creator 内存）还没读也没移植；若 k21 又在表面类型上出问题先看这三个。
+- **k21 结果（14:23，0111 内核，`logs/boot-k21.txt`）**：**没有 panic，0111 有效**。锁屏出现了，是 GPU 路径画的（用户拍照：背景渐变正确，但时钟/日期文字被放大、错位）。
+  日志：backboardd 第一次起来后 sweet-gl 建了 GL 上下文，`SweetGPU: submission` 累计 223 次；但出现 30 次 `SweetGPU: a buffer of N bytes cannot be entered into the GPU's address space`（5-12 MB 的整屏表面）、
+  GL 报 0x505（OUT_OF_MEMORY）/0x506，随后 backboardd[56] SIGSEGV（far 0x18，pc 在被注入的库里），launchd 重启 backboardd[235]，第二个 backboardd 在残缺的 GPU 缓冲下继续画（所以文字尺寸不对）。
+  suggestd 另有一个 sig 10 崩溃（与 GPU 无关，未查）。
+  **原因（读代码得出）**：`picasso_adreno.c` 的 `SPACE_TABLES` 只有 64，每个第 3 级表管 2 MiB → 总共约 120 MB 不同地址，用完 `space_map` 返回 false。ios-apollo 0112 用的是 2304，我移植时漏了。
+- **0112**：`SPACE_TABLES` 64 → 2304（两个空间各约 36 KB 静态数组，表按需分配）。**k22 = k21 命令行 + 0112 内核**。验证：不再出现 "cannot be entered"，没有 0x505/0x506 和 backboardd 崩溃，文字大小恢复正常。
+  若文字仍然放大：看 ios-apollo 的 0115（planar 表面）/0159（缩放翻页）。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、

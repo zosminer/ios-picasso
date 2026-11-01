@@ -1,0 +1,13 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -673,7 +673,9 @@ step_cmd_db(void)
+ #define PTE_PAGE                3ull
+ #define PTE_ADDRESS             0x0000fffffffff000ull
+ #define PTE_GMU                 (2ull << 8 | 1ull << 10 | 1ull << 11)   /* 共享、AF、nG；属性 0 = 不缓存 */
+-#define SPACE_TABLES            64
++/* picasso 0112：64 个表只够约 120 MB 的不同地址（每个第 3 级表管 2 MiB），锁屏的整屏表面（每个 5-12 MB）几个就用完，
++ * SweetGPU 报 "cannot be entered into the GPU's address space"。和 ios-apollo 0112 一样取 2304（3.5 GiB 的地址空间全覆盖）；按需分配，不用的不占内存。 */
++#define SPACE_TABLES            2304
+ 
+ struct gpu_space {
+ 	const char *name;
