@@ -356,6 +356,18 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   `research/ios16-root-gpu.simg`（12159920168 字节附近，sha256 c0422826…，522 个 launchd 任务，fsck OK）。
   踩过的坑：Lima 里没有 `wheel` 组（用 -o 0 -g 0）；`sudo python3` 写不了普通用户在 /tmp 的临时文件（protected_regular）；Lima 的 /tmp 和 macOS 的不是同一个（脚本放仓库目录）。
   **k17**（0108-0110 内核，`picassogpu=3 picassogpukeep=1`，11:55:17 启动）：用户感觉桌面没变化——正确，桌面还是 CPU 画，要等 sweetinject 才走 GPU。k17 日志还没读。
+- **🎉🎉🎉 k18（2026-11-01 13:07 启动，新镜像 ios16-root-gpu.simg 首次开机，0108-0110 内核，`picassogpu=3 picassogpukeep=1 sweetnull=sweet-gpu-test,sweet-gl-test`，无 sweetinject）**
+  日志 `logs/boot-k18.txt`（2227 行）观测：
+  - GPU 常开 + 服务：`THE GPU IS KEPT ON (400 MHz, ring at word 123, addresses 0x20000000+0xe0000000)`、
+    `kept: self-test: submission 1 ... SUBMISSIONS AND FENCES WORK`、`SweetGPU: registered`。
+  - **sweet-gl-test：`freedreno; FD620; OpenGL ES 3.2 Mesa 25.0.7 (the GPU)`** —— iOS 里的程序通过 Mesa 25.0.7 的 freedreno 认出 Adreno 620，GLES 3.2，走 GPU。
+  - **sweet-gpu-test：`Adreno 620, chip id 0x6020001, GMEM 512 KiB, 400 MHz`；提交 0、1、…、15、31、47 每一次 fence 都完成，写回的字正确（0xc0de0000 + n）**。
+  - 内核日志：`SweetGPU: submission 2/3/4: 1 command buffers, the first at 0x20ce0000...`。SpringBoard、lsd 都 exec 了（lsd 在 894 行）。
+  - **没有 panic。** 用户在 13:23 看到苹果标志页面自己重启：电量计开机读数 `1% 3177mV -608mA charging=0`，结尾充电器寄存器跳变
+    （icl_st=00，apsd_result 00/04 来回，chg_st1=47）→ **电池耗尽断电重启，不是我们的代码崩溃**（需要充电后重测）。
+    疑点（待查）：chg_st1=47 与之前 03/04 不同；我们的 picassocharge 喂狗在新镜像下是否有影响；USB 线接触。
+  - **结论：第 2 步（GPU 常开 + 服务）和第 3 步的"Mesa 在 GPU 上能跑"都已在真机验证。** 剩下：把 CoreAnimation 桥注入 backboardd，让桌面走 GPU：
+    `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd sweetnull=backboardd`（库已在镜像里）。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
