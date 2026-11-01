@@ -1,0 +1,68 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -2046,6 +2046,10 @@ step_core_commands(void)
+ #define PANEL_FB_PA             0xa0000000u     /* 日志：AppleCLCD 1080x2400 stride 4320 at 0xa0000000 */
+ #define PANEL_ROW               (TARGET_W * 4u)
+ 
++/* iokit/Kernel/arm/SweetFramebuffer.cpp：面板内存在内核里的映射 */
++extern uintptr_t sweet_fb_panel_kva;
++extern uint32_t sweet_fb_panel_row, sweet_fb_panel_height;
++
+ static void
+ ring_register(uint32_t number, uint32_t value)
+ {
+@@ -2155,16 +2159,22 @@ step_frame(void)
+ 		return false;
+ 	}
+ 	printf(TAG ": %u: THE GPU HAS DRAWN A PICTURE\n", step);
+-	/* 抄到面板的帧缓冲；iOS 的显示驱动会周期性重画，所以每 50 ms 抄一次，持续几秒让人看见 */
+-	vm_offset_t fb = ml_io_map_wcomb(PANEL_FB_PA, round_page(PANEL_ROW * TARGET_H));
+-	if (fb == 0) {
+-		printf(TAG ": %u: the panel's framebuffer cannot be mapped\n", step);
++	/*
++	 * 抄到面板内存；iOS 的显示驱动会周期性重画，所以每 50 ms 抄一次，持续几秒让人看见。
++	 * k15 教训：这里不能自己 ml_io_map_wcomb 10 MB，内核的 IO 映射空间不够，kmem_alloc 失败直接 panic。
++	 * 用 SweetFramebuffer.cpp 已经映射好的地址。
++	 */
++	vm_offset_t fb = (vm_offset_t)sweet_fb_panel_kva;
++	uint32_t panel_row = sweet_fb_panel_row, panel_height = sweet_fb_panel_height;
++	if (fb == 0 || panel_row < PANEL_ROW || panel_height < TARGET_H) {
++		printf(TAG ": %u: the display driver has not published the panel memory (kva %#lx row %u height %u)\n", step,
++		    (unsigned long)fb, panel_row, panel_height);
+ 		return true;
+ 	}
+ 	for (uint32_t frame = 0; frame < show_seconds * 20; frame++) {
+ 		for (uint32_t y = 0; y < TARGET_H; y++) {
+ 			const volatile uint32_t *src = (const volatile uint32_t *)(core_target.memory + y * TARGET_ROW);
+-			volatile uint32_t *dst = (volatile uint32_t *)(fb + y * PANEL_ROW);
++			volatile uint32_t *dst = (volatile uint32_t *)(fb + y * panel_row);
+ 			for (uint32_t x = 0; x < TARGET_W; x++) {
+ 				dst[x] = src[x];
+ 			}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,12 @@ extern "C" void picasso_backlight_power(int on);        /* bsd/dev/picasso_backl
+ extern "C" void picasso_cpufreq_display(int on);       /* bsd/dev/picasso_cpufreq.c */
+ extern "C" int picasso_backlight_set(int level);         /* bsd/dev/picasso_backlight.c，0..4095 */
+ extern "C" void sweet_amfi_service_init(void);           /* iokit/Kernel/arm/SweetAMFIService.cpp（sapphire 0156） */
++/* picasso：面板内存在内核里的映射，给 bsd/dev/picasso_adreno.c 的 GPU 画图测试用（0 = 还没有） */
++extern "C" {
++uintptr_t sweet_fb_panel_kva;
++uint32_t sweet_fb_panel_row;
++uint32_t sweet_fb_panel_height;
++}
+ /* picasso：qcom,mdss-dsi-panel-peak-brightness = 4200000（0.0001 nit）= 420 nit，对应 WLED 满量程 0xfff */
+ #define SWEET_FB_MAX_NITS               420
+ #define SWEET_FB_BL_MAX                 0xfff
+@@ -225,6 +231,11 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/* picasso：GPU 测试（bsd/dev/picasso_adreno.c 第 19 步）要把画好的图抄到面板内存。k15 上它自己再映射 10 MB
++	 * 把内核的 IO 映射空间用光，内核 panic（kmem_alloc ... failed with 3），所以直接用这里已经有的映射。 */
++	sweet_fb_panel_kva = fPixels;
++	sweet_fb_panel_row = fRowBytes;
++	sweet_fb_panel_height = fHeight;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");

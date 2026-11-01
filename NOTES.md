@@ -316,6 +316,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   持续 `picassogpushow` 秒（默认 6）。**RB_CCU_CNTL 默认 0x08000000（A620：Mesa num_ccu 1）**；A650 用 0x18000000（ios-apollo 实测）。
   不对时 `picassoccu=0x18000000` 或 `0x10000004`（HackiOS A660）。写法抄 ios-apollo 补丁 0110（MIT）和 HackiOS 第 22 步。
   **k15**（sha256 见命令输出）= 0106 内核 + picasso-gpu.adt + k14 命令行（picassogpuslow=300），已 fastboot boot，等用户回报屏幕上有没有三条色带。
+- **k15 结果：内核 panic**（用户拍照 + `logs/boot-k15.txt`，日志停在第 18 步宣布之后，崩溃时最后一秒没落盘）：
+  `panic: kmem_alloc(..., 10371072, 0x100021) failed with 3 @vm_kern.c:176`。10371072 = round_page(4320 × 2400)，即我在 step_frame 里
+  `ml_io_map_wcomb(0xa0000000, 面板大小)` 自己再映射一遍面板内存：内核 IO 映射空间不够，kmem_alloc 带不可失败标志，直接 panic。
+  桌面先正常显示了，约 1 分钟 GPU 测试跑到第 19 步才崩。**教训：不要在 GPU 线程里自己 ml_io_map 大块内存。**
+- **0107**：SweetFramebuffer.cpp 把面板内存的内核映射（fPixels，已有的 IOSurface 映射）公开为 `sweet_fb_panel_kva/row/height`，
+  step_frame 直接用它抄像素，没有就跳过显示（只核对像素）。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
