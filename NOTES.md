@@ -323,6 +323,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
 - **0107**：SweetFramebuffer.cpp 把面板内存的内核映射（fPixels，已有的 IOSurface 映射）公开为 `sweet_fb_panel_kva/row/height`，
   step_frame 直接用它抄像素，没有就跳过显示（只核对像素）。
 - CI 41266793021（macos-15）成功，产物 `xnu/out-0107/`。**k16** = 0107 内核 + picasso-gpu.adt + k15 命令行，已 fastboot boot，等用户回报色带。
+- **🎉🎉🎉 k16（2026-11-01 11:04 启动，0107）：GPU 画出了图，用户拍到屏幕照片。**
+  屏幕上自上而下：**橙 / 白 / 蓝**三条色带，各占约三分之一，和命令一致（ff8000 / ffffff / 0080ff）。
+  观测：颜色顺序和 BGRA 字节序都对，默认 `RB_CCU_CNTL = 0x08000000`（A620：Mesa num_ccu 1）直接可用，不需要 `picassoccu`。
+  这证明 3D 核心的 2D 引擎经 SMMU 往我们的内存写了 1080x2400 的像素，缓存刷出后 CPU 读到的和屏幕显示的一致。
+  （日志里的像素核对行和 "A PICTURE DRAWN BY THE GPU WAS ON THE PANEL" 还没拉，用户没进 fastboot；照片已足够证明。）
+  到这里和 ios-apollo 的 boot 26 同一进度。**下一步是第 2 步：GPU 保持开启 + 服务，然后第 3 步 Mesa + CoreAnimation 桥。**
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、
