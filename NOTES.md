@@ -274,6 +274,14 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   但整次没停充；OrangeFox 里 93%。SpringBoard 开机早期 sig 11 崩一次后重启（GPU 步骤之前，无关）。
 - **下一步（用户已批准，2026-11-01）：0103 = HackiOS 步骤 11/12/18-21**：TrustZone SCM 询问、zap 签名（PAS 13，a620_zap.mdt）、
   zap 加载（auth_and_reset）、3D 核心的 SMMU 上下文 0（流 0/1）+ ring + a650_sqe.fw、CP 启动、ME_INIT、出安全模式、CP_MEM_WRITE 测试。
+- **0103**（CI 41260121854，macos-15）：picasso_adreno.c 加第 14-18 步，顺序照原厂 a6xx_rb_start（CP 先起、ME_INIT、再 zap、再出安全模式）：
+  14 TrustZone IS_CALL_AVAILABLE / PAS_IS_SUPPORTED(13)；15 SMMU 上下文 0（HUPCF）给流 0（SMR 0）和流 1（SMR 2），
+  ring 0x01000000（32K）、SQE 0x01100000（a650_sqe.fw 去掉第一个字，只读）、草稿页 0x01200000；
+  16 a6xx_start 的 a620 值（a650_gbif_regs、ROQ 0x02000140/0x8040362c、PC_DBG_ECO 0x10200、UBWC 3.0 hbb 14：
+  RB_NC 0x12 / TPL1_NC 0x2 / SP_NC 0x22 / UCHE_MODE 1<<21、hang 0x3ffff、APRIV 0x6e，12 个地址模式寄存器 = 1），
+  SQE_CNTL=1，ME_INIT（0x2f 掩码，8 字）；17 zap：PAS_SHUTDOWN 先清、INIT_IMAGE(mdt 148+6712)、MEM_SETUP(0x8bc15400, 0x1000)、
+  写 b02（0x68c 字节，段 2 可重定位 paddr 0x5000 → 区域开头）、AUTH_AND_RESET；18 CP_SET_SECURE_MODE 0、CP_MEM_WRITE 0x600dc0de。
+  `picassonozap=1`：不问 TZ，第 18 步改为直接写 RBBM_SECVID_TRUST_CNTL=0（原厂没有 zap 时的做法）。撤回：GBIF halt、zap 卸载、SMMU 上下文 0 关。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
