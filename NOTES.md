@@ -400,6 +400,16 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **图标假设（未证实）**：共享给 GPU 的表面（233 个）行距不是 128 的倍数时 Adreno 读错位（屏幕表面 4608/6144 是对齐的，SpringBoard 的 3152/224 不是）。桥库有 boot-arg `glcopy=1` 关闭共享（全部拷贝），用它 A/B。
 - **0113**：GPU 速度表补全到 750 MHz（`picassogpuspeed` 下标：2=400, 3=500, 4=540, 5=625, 6=670, 7=700, 8=750）。**k25 = 0113 内核 + `picassogpuspeed=8` + `glcopy=1`**（其余同 k23）。看：无 GMU 拒绝/挂起、"waiting for the picture" 的毫秒数是否下降、图标是否完整。
   待办：About 打不开（需要 Preferences 的日志，可能要抓 stderr）；默认语言改 zh-Hans（改镜像要重刷 userdata；或用户在设置 → General → Language & Region 里改）；若 glcopy=1 让图标正常，则在 eagl.c surface_shared 里按行距对齐决定是否共享，更新 libsweet-gl 后需重刷镜像。
+- **远程调试代理（2026-11-01，用户要求"把手机丢给你自己测"，避免每次重刷）**：
+  1. **0114 = ios-apollo 0120-0123 合并**：`bsd/dev/sweet_files.c`，开机时把设备树 `/sweet-files` 里的文件写进根目录（launchd 之前；`sweetfiles=0` 关）。
+     `tools/mkadt.py` 新增 `--file DEST=LOCAL [UID:GID:MODE]`、`--files-from LIST`、`--delete DEST`、`--list PATH`（DEST 只能在 `FILE_PREFIXES` 之下：/usr/local/、/private/var/ 等）。**以后换库不用重刷 12 GB：改 boot 镜像里的文件即可。**
+  2. **`userland/agent/sweet_agent.c` → `libsweet-agent.dylib`**：用 `sweetinject=...;/usr/local/lib/libsweet-agent.dylib:configd` 插进 configd，在 **192.168.7.2:2323** 监听（只绑 USB 口，无认证）。
+     命令：ping/info/ls/stat/cat/put/rm/mkdir/mv/chmod/run/sysctl/kill/reboot（镜像里没有 sh/ls/cat，所以全是自带的）。电脑侧 `tools/sweet-ctl.py`（wait / get / put / run …）。
+     本地编译：`xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-agent.dylib -o libsweet-agent.dylib userland/agent/sweet_agent.c && codesign -s - -f libsweet-agent.dylib`（已验证通过，没有上机）。
+  3. **前提**：内核 `sweetusb=2`（USB 网口 ue0 = 192.168.7.2/24）；电脑侧要给 USB 网口配 192.168.7.1/24（macOS：`sudo ifconfig enN 192.168.7.1/24 up`，网口 MAC 02:00:5e:77:ee:01；这需要 sudo 密码，Claude 没有）。
+  **未验证**：iOS 里 sweetusb=2 + 弱电池；configd 里线程能否监听；macOS 对 CDC-ECM 的支持。
+  **Wi-Fi / 蓝牙现状（诚实）**：都**不工作**。这台是 WCN3990（icnss/SNOC + 蓝牙 UART/slimbus），不是 ios-apollo 的 QCA6390（PCIe）；ios-apollo 的 wifi 补丁 0126-0129 不能直接用。基带 PAS 能起、GLINK/QRTR 通，但 wlan_pd 不起（见 480 行）。bluetoothd 在重启循环。这是单独的大项目，有了调试代理才好做。
+  亮度：`picassobl` 驱动在（默认启用？见 586 行），未单项复测。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、

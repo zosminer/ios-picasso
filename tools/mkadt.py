@@ -5,6 +5,10 @@ Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--lowmem]
   [--high-base=0x.. --high-size=0x..] [--touch-fw=DIR | --no-touch-fw]
 picasso 默认用真机验证过的高位内存段（0x140000000+3G）；--lowmem 回到旧的低位窗口，--qemu 也用低位。
+--file DEST=LOCAL [UID:GID:MODE]（可多次）/ --files-from LIST / --delete DEST / --list PATH：
+  把文件放进 /sweet-files 节点，内核（补丁 0114，bsd/dev/sweet_files.c）在 launchd 启动前写到手机根目录，
+  不用重刷 userdata。LIST 每行 "DEST=LOCAL [UID:GID:MODE]"、"-DEST"（先删）、"?PATH"（把匹配打印进内核日志），# 开头是注释。
+  DEST 只能在 FILE_PREFIXES 之下，最多 64 个文件、48 MiB。
 """
 import hashlib, os, struct, sys
 
@@ -136,6 +140,56 @@ def node(name, props=(), children=()):
     return n
 
 
+
+# 内核（sweet_files.c）接受的目的路径前缀；保持保守：我们的库、调试代理、少数设置目录
+FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System/Library/xpc/',
+                 '/Library/Preferences/', '/private/etc/')
+FILES_MAX, FILES_BYTES = 64, 48 << 20
+def files_node(argv):
+    """--file / --files-from / --delete / --list 的参数 -> /sweet-files 节点（没有就返回 None）。
+    格式见 bsd/dev/sweet_files.c：fileN = 路径\\0内容，ownerN = uid,gid,mode 三个 32 位字，deleteN / listN = 路径\\0。"""
+    wanted = []
+    for i, a in enumerate(argv):
+        if a == '--file':
+            wanted.append(('--file', argv[i + 1]))
+        elif a == '--delete':
+            wanted.append(('--delete', '-' + argv[i + 1]))
+        elif a == '--list':
+            wanted.append(('--list', '?' + argv[i + 1]))
+        elif a == '--files-from':
+            for n, line in enumerate(open(argv[i + 1], encoding='utf-8'), 1):
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    wanted.append((f'{argv[i + 1]} line {n}', line))
+    files, deletes, lists = [], [], []
+    ok = lambda d: d.startswith(FILE_PREFIXES) and '/../' not in d + '/' and '*' not in d
+    for where, spec in wanted:
+        if spec.startswith(('-', '?')):
+            dest = spec[1:]
+            if not dest.startswith(FILE_PREFIXES) or '/../' in dest + '/':
+                raise SystemExit(f'{where}: {spec}: 路径要在 ' + ', '.join(FILE_PREFIXES) + ' 之下')
+            (deletes if spec[0] == '-' else lists).append(dest)
+            continue
+        owner = None
+        parts = spec.split()
+        dest, _, local = parts[0].partition('=')
+        if len(parts) > 1:
+            uid, gid, mode = parts[1].split(':')
+            owner = (int(uid), int(gid), int(mode, 8))
+        if not local or not ok(dest):
+            raise SystemExit(f'{where}: {spec}: 写成 DEST=LOCAL_FILE [UID:GID:MODE]，DEST 在 ' + ', '.join(FILE_PREFIXES) + ' 之下')
+        files.append((dest, open(local, 'rb').read(), owner))
+    if not (files or deletes or lists):
+        return None
+    if len(files) > FILES_MAX or sum(len(d) for _, d, _ in files) > FILES_BYTES:
+        raise SystemExit(f'--file: 最多 {FILES_MAX} 个文件、{FILES_BYTES >> 20} MiB')
+    for dest, data, _ in files:
+        print(f'/sweet-files: {dest} ({len(data)} bytes)', file=sys.stderr)
+    return node('sweet-files', [('AAPL,phandle', u32(0x5ff1))]
+        + [(f'list{i}', cstr(d)) for i, d in enumerate(lists)]
+        + [(f'delete{i}', cstr(d)) for i, d in enumerate(deletes)]
+        + [(f'file{i}', cstr(d) + data) for i, (d, data, _) in enumerate(files)]
+        + [(f'owner{i}', u32(*o)) for i, (_, _, o) in enumerate(files) if o is not None])
 def build(seed=None, qemu=False, highmem=True, touch_fw_dir=TOUCH_FW_DIR, gpu_fw_dir=GPU_FW_DIR):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py).
     touch_fw_dir：picasso 触控固件目录（None = 不放 /picasso-touch）。"""
@@ -334,6 +388,9 @@ if __name__ == '__main__':
     # 默认高位内存段（真机验证过）；--lowmem 回到旧低位窗口，--qemu 也用低位。
     highmem = '--lowmem' not in sys.argv and '--qemu' not in sys.argv
     root = build(qemu='--qemu' in sys.argv, highmem=highmem, touch_fw_dir=touch_dir, gpu_fw_dir=gpu_dir)
+    extra = files_node(sys.argv)
+    if extra is not None:
+        root.children.append(extra)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
