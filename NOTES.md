@@ -394,6 +394,12 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   **原因（读代码得出）**：`picasso_adreno.c` 的 `SPACE_TABLES` 只有 64，每个第 3 级表管 2 MiB → 总共约 120 MB 不同地址，用完 `space_map` 返回 false。ios-apollo 0112 用的是 2304，我移植时漏了。
 - **0112**：`SPACE_TABLES` 64 → 2304（两个空间各约 36 KB 静态数组，表按需分配）。**k22 = k21 命令行 + 0112 内核**。验证：不再出现 "cannot be entered"，没有 0x505/0x506 和 backboardd 崩溃，文字大小恢复正常。
   若文字仍然放大：看 ios-apollo 的 0115（planar 表面）/0159（缩放翻页）。
+- **k22/k23/k24 结果（用户反馈）**：0112 修好了映射失败（k22 无崩溃、无 GL 错误）。k23 = CPU `picassocpufreq=2`（亮屏 1804/2208/2400 MHz，日志确认）+ `sweetfb_hz=60` + GPU 500 MHz：比之前好多了，但仍不到 60 帧。
+  k23 日志（`logs/boot-k23.txt`，logs/ 不入库）：滑动时一帧 ~100 次绘制，**CPU 提交只要 ~2 ms，等 GPU 画完 ~9-15 ms**，平均 23 ms/帧 → 瓶颈在 GPU 时钟。
+  **k24 = 去掉 sweetinject 的对比版**：设置里**图标正常** → 图标显示不完整是 GPU 桥的问题；**About（关于本机）在软件渲染下也打不开** → 与 GPU 无关，是系统问题（Preferences 被重新 exec 了 3 次，没有 CRASH、没有 Jetsam，原因未知，待查）。界面是英文：镜像里 `.GlobalPreferences.plist` 是 `en_US`，`Preferences.app/zh_CN.lproj` 存在。
+  **图标假设（未证实）**：共享给 GPU 的表面（233 个）行距不是 128 的倍数时 Adreno 读错位（屏幕表面 4608/6144 是对齐的，SpringBoard 的 3152/224 不是）。桥库有 boot-arg `glcopy=1` 关闭共享（全部拷贝），用它 A/B。
+- **0113**：GPU 速度表补全到 750 MHz（`picassogpuspeed` 下标：2=400, 3=500, 4=540, 5=625, 6=670, 7=700, 8=750）。**k25 = 0113 内核 + `picassogpuspeed=8` + `glcopy=1`**（其余同 k23）。看：无 GMU 拒绝/挂起、"waiting for the picture" 的毫秒数是否下降、图标是否完整。
+  待办：About 打不开（需要 Preferences 的日志，可能要抓 stderr）；默认语言改 zh-Hans（改镜像要重刷 userdata；或用户在设置 → General → Language & Region 里改）；若 glcopy=1 让图标正常，则在 eagl.c surface_shared 里按行距对齐决定是否共享，更新 libsweet-gl 后需重刷镜像。
 - **接手说明（第 2、3 步，给下一个助手）**：参考 `src/.scratch/github-refs/ios-apollo`（MIT）。内核：补丁 0112（sweet_gpu.c 的 GPU 保持开启 + 地址分配 + submit + SweetGPU.cpp 的 IOService 与 msm 风格 user client，约 1100 行）、
   0114（CoreAnimation 桥，651 行）、0159（缩放翻页）、0163（挂起恢复）；用户态 `userland/mesa`（freedreno）、`userland/ca-bridge`（libsweet-ca，用 `sweetinject=` 注入 backboardd）、`tools/mesa/redwood-drm`（假 libdrm）。
   对我们这台要改的：A650 → A620（固件名 a650_gmu/a650_sqe 同，zap 是 a620_zap）、PAS 内存地址用整页对齐的 0x8bc16000、CCU 0x08000000、

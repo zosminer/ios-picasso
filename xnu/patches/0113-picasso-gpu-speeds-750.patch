@@ -1,0 +1,20 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -1406,10 +1406,15 @@ rail_vote(uint32_t level, const uint16_t *rail, unsigned rail_levels, const uint
+ 	return true;
+ }
+ 
+-/* gpu-opp-table 里最低的三档（小米这台最高 750 MHz，第一次上电只用到 500 MHz） */
++/*
++ * gpu-opp-table 全部档位（设备树 picasso-merged.dts：opp-microvolt 即 gfx.lvl 等级，cmd-db 里有 0 64 128 192 256 320 384 416）。
++ * picasso 0113：原来只有到 500 MHz 的三档；桌面一帧 100 次绘制要等 GPU 15 ms（k23 日志），所以补全到 750 MHz。
++ * 选档用 boot-arg picassogpuspeed=下标：2 = 400 MHz（默认），3 = 500，4 = 540，5 = 625，6 = 670，7 = 700，8 = 750。
++ */
+ static const struct {
+ 	uint32_t khz, level;
+-} speeds[] = { { 0, 0 }, { 275000, 64 }, { 400000, 128 }, { 500000, 192 } };
++} speeds[] = { { 0, 0 }, { 275000, 64 }, { 400000, 128 }, { 500000, 192 }, { 540000, 256 }, { 625000, 256 },
++	       { 670000, 320 }, { 700000, 320 }, { 750000, 384 } };
+ static uint32_t speed_index = 2;
+ 
+ static bool
