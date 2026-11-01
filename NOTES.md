@@ -243,7 +243,14 @@ MIUI 13 V13.0.3.0.SGICNXM）上运行同一套 XNU-8796 内核和 iPhone X 的 i
   从 ADT `/picasso-gpu` 取：`tools/mkadt.py` 现在把 research/picasso-gpu-fw/ 的 6 个文件放进去（ADT 519996 字节）。
   13 步：CX → 读 GMU/GBIF → 读 RSCC → 读 SMMU → DTCM 测试 → cmd-db → GMU 内存 + SMMU 上下文 → RSC/PDC 微码 →
   固件 → 放开 CM3（等 0x100）→ HFI → 表 + CORE_FW_START + 投票 → OOB GPU、START、读 RBBM。结束后全部撤回（CX 关）。
-  只编译检查（SDK 头缺私有接口），交 CI：push run 41255719440（macos-14）+ dispatch 41255730512（macos-15）。
+  第一次 CI 41255730512 只差 ml_io_map_wcomb 未声明；改后每一步宣布之后都停 picassogpuslow 毫秒（默认 1200），
+  CI **41256605444 成功**（macos-15），产物 `xnu/out-0101/`。
+- **k9 日志** `logs/boot-k9.txt`：**Xcode 16 内核在真机上正常进桌面**（SpringBoard、触摸、按键都有），工具链迁移可用。
+  充电器那行被 IOLog 截在约 256 字符，而且 "some reads failed"（推测 MISC 0x16xx 读不到）→ chargerKeep 提前返回、没有喂狗；
+  开机时 chg_st1=03（FULLON 在充），之后寄存器没变化（没有第二行）。待改：拆成两行打印，MISC 读失败也照样写其他位。
+  OrangeFox 里 capacity 65 Charging。电量计开机 84%（充电中 OCV 偏高），又不准。
+- **k10**（sha256 41ff5406…）= 0101 内核 + `shim/out/picasso-gpu.adt`（带 /picasso-gpu 固件）+ k5 命令行 +
+  `picassogpu=3 picassogpudelay=60 picassogpuslow=1200`：开机 60 s 后跑 GMU 全部 13 步再撤回。已 fastboot boot。
 
 ### 按 GitHub 新结论做的修复（2026-10-24，离线完成，未上机）
 - **0090 改**（根据另一台 K30 的 omp 分支实测）：
