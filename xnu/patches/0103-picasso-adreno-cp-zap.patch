@@ -1,0 +1,566 @@
+--- a/bsd/dev/picasso_adreno.c
++++ b/bsd/dev/picasso_adreno.c
+@@ -27,7 +27,12 @@
+  *  10  写  GMU 配置，放开 CM3，等 FW_INIT_RESULT 0x100
+  *  11  写  HFI 队列启动
+  *  12  谈  性能表、带宽表、CORE_FW_START、频率投票
+- *  13  谈  OOB 请求 GX 上电，HFI START，读 RBBM：3D 核心第一次有电
++ *  13  谈  OOB 请求 GX 上电，HFI START，读 RBBM：3D 核心第一次有电（k11 真机通过）
++ *  14  问  TrustZone 接不接这个内核的调用、支不支持 GPU 镜像 13（picassonozap=1 跳过 14 和 17）
++ *  15  写  3D 核心的内存（ring、a650_sqe.fw、草稿页）、SMMU 上下文 0（流 0 和 1）
++ *  16  写  3D 核心寄存器（原厂 a6xx_start 的 a620 值），启动 SQE，ME_INIT
++ *  17  问  zap shader：签名（a620_zap.mdt）、位置 0x8bc15400、写入 b02、校验并运行
++ *  18  命令  出安全模式，CP_MEM_WRITE 往我们的页写一个字
+  * 其他 boot-arg：picassogpuslow=MS 最新一步每次宣布之后等这么久（默认 1200，日志每秒落盘）、
+  *   picassogpuspeed=1..3（275/400/500 MHz，默认 2）、picassogpuwatch=S（最后一步之后每秒报活 S 秒，默认 10）。
+  */
+@@ -673,6 +678,7 @@ step_cmd_db(void)
+ struct gpu_space {
+ 	const char *name;
+ 	uint32_t context;
++	uint32_t control;               /* SCTLR 里另外要的位（3D 核心：HUPCF，出错后其余请求照常服务） */
+ 	uint32_t table_count;
+ 	uint64_t *root;
+ 	struct {
+@@ -741,8 +747,17 @@ struct gpu_block {
+ 	vm_offset_t memory;
+ };
+ 
++static bool block_new_as(struct gpu_space *space, struct gpu_block *block, uint64_t address, uint32_t size,
++    uint64_t attributes);
++
+ static bool
+ block_new(struct gpu_space *space, struct gpu_block *block, uint64_t address, uint32_t size)
++{
++	return block_new_as(space, block, address, size, PTE_GMU);
++}
++
++static bool
++block_new_as(struct gpu_space *space, struct gpu_block *block, uint64_t address, uint32_t size, uint64_t attributes)
+ {
+ 	block->address = address;
+ 	block->size = (size + 4095) & ~4095u;
+@@ -752,7 +767,7 @@ block_new(struct gpu_space *space, struct gpu_block *block, uint64_t address, ui
+ 		return false;
+ 	}
+ 	for (uint32_t off = 0; off < block->size; off += 4096) {
+-		if (!space_map(space, address + off, kvtophys(block->memory + off), PTE_GMU)) {
++		if (!space_map(space, address + off, kvtophys(block->memory + off), attributes)) {
+ 			return false;
+ 		}
+ 	}
+@@ -827,7 +842,7 @@ space_on(struct gpu_space *space, uint32_t match, uint32_t stream)
+ 		printf(TAG ": %u: the SMMU does not finish the TLB sync (%#x)\n", step, rd(smmu.base + cb + SMMU_CB_TLBSTATUS));
+ 		return false;
+ 	}
+-	put(&smmu, "cb sctlr", cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON);
++	put(&smmu, "cb sctlr", cb + SMMU_CB_SCTLR, SMMU_SCTLR_ON | space->control);
+ 	put(&smmu, "s2cr", SMMU_S2CR(match), space->context);
+ 	put(&smmu, "smr", SMMU_SMR(match), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream);
+ 	if (get(&smmu, "smr", SMMU_SMR(match)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | stream) ||
+@@ -872,7 +887,7 @@ struct gmu_fw_block {
+ 	uint32_t address, size, type, value;
+ };
+ 
+-static struct gpu_space gmu_space = { .name = "the GMU", .context = 1 };
++static struct gpu_space gmu_space = { .name = "the GMU", .context = 1, .control = 0 };
+ static uint32_t gmu_match = 1;
+ static struct gpu_block gmu_blocks[12], gmu_log, gmu_hfi;
+ static unsigned gmu_block_count;
+@@ -1480,6 +1495,446 @@ step_gx(void)
+ 	return !space_faulted(&gmu_space);
+ }
+ 
++/* ---------------------------------------------------------------- 14. TrustZone */
++
++/*
++ * 3D 核心上电时处于"安全模式"，只有 TrustZone 能放它出来：交给 TZ 校验并运行厂商签名的 zap shader
++ * （原厂设备树 qcom,kgsl-hyp：pil-tz-generic、qcom,pas-id 13、a620_zap；内存 pil_gpu_region@8bc15400 0x2000）。
++ * 调用约定照 HackiOS（Linux qcom_scm-smc.c）：SMC64、SIP、服务 2（PAS）。
++ */
++#define SCM_FAST                (1ull << 31)
++#define SCM_64                  (1ull << 30)
++#define SCM_SIP                 (2ull << 24)
++#define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
++#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
++#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
++#define SCM_PAS_IS_SUPPORTED    SCM_CALL(2, 7)
++#define SCM_ONE_VALUE           1
++#define SCM_THREE_VALUES        3
++#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
++#define SCM_INTERRUPTED         1
++#define PAS_GPU                 13
++#define ZAP_MEMORY              0x8bc15400ull
++#define ZAP_MEMORY_SIZE         0x2000u
++
++static int32_t
++scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
++    uint64_t *answer)
++{
++	uint64_t session = 0;
++	printf(TAG ": %u: ask TrustZone %s: smc %#llx (%#llx, %#llx, %#llx)\n", step, what, function, first, second, third);
++	snprintf(last_write, sizeof(last_write), "step %u asked TrustZone %#llx", step, function);
++	for (int i = 0; i < 100; i++) {
++		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = arguments;
++		register uint64_t x2 __asm__("x2") = first;
++		register uint64_t x3 __asm__("x3") = second;
++		register uint64_t x4 __asm__("x4") = third;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5), "+r" (x6),
++		    "+r" (x7) : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			printf(TAG ": %u: TrustZone returns %d, answer %#llx\n", step, (int32_t)x0, x1);
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	printf(TAG ": %u: TrustZone keeps saying the call was interrupted\n", step);
++	return -1;
++}
++
++static uint64_t scm_how = SCM_FAST | SCM_64 | SCM_SIP;
++static uint32_t no_zap;
++
++static bool
++step_tz(void)
++{
++	uint64_t answer = 0;
++	(void)PE_parse_boot_argn("picassonozap", &no_zap, sizeof(no_zap));
++	if (no_zap) {
++		printf(TAG ": %u: picassonozap=1: TrustZone is not asked\n", step);
++		return true;
++	}
++	announce("ask TrustZone whether it takes calls from this kernel, and whether it supports the GPU's image (13)");
++	if (scm("whether it can be asked", scm_how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE,
++	    0, 0, &answer) != 0 || answer != 1) {
++		scm_how = SCM_FAST | SCM_SIP;
++		if (scm("the same, 32-bit", scm_how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_IS_CALL_AVAILABLE,
++		    0, 0, &answer) != 0 || answer != 1) {
++			printf(TAG ": %u: TrustZone does not answer the way it answers Linux\n", step);
++			return false;
++		}
++	}
++	scm("for PAS init image", scm_how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_INIT_IMAGE, 0, 0, &answer);
++	scm("for PAS auth and reset", scm_how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE, SCM_SIP | SCM_PAS_AUTH_AND_RESET, 0, 0,
++	    &answer);
++	answer = 0;
++	scm("whether image 13 (GPU) is supported", (scm_how & ~SCM_FAST) | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, PAS_GPU, 0, 0,
++	    &answer);
++	return true;
++}
++
++/* ---------------------------------------------------------------- 15. 3D 核心的地址空间 */
++
++#define PTE_CORE                (PTE_GMU | 1ull << 6)           /* 3D 核心的访问是非特权的 */
++#define PTE_READ_ONLY           (1ull << 7)
++#define CORE_RING_ADDRESS       0x01000000u
++#define CORE_RING_SIZE          0x8000u
++#define CORE_SQE_ADDRESS        0x01100000u
++#define CORE_SCRATCH_ADDRESS    0x01200000u
++#define CORE_MATCH              0u
++#define CORE_STREAM1_MATCH      2u
++static struct gpu_space core_space = { .name = "the 3D core", .context = 0, .control = 1u << 8 };
++static struct gpu_block core_ring, core_sqe, core_scratch;
++static bool core_space_is_on, core_stream1_is_on, core_runs, zap_is_loaded;
++#define RING_WORDS              (CORE_RING_SIZE / 4)
++static uint32_t ring_at, ring_sent;
++
++#define GPU_W(n)                (4u * (n))
++#define RBBM_GBIF_CLIENT_QOS_CNTL GPU_W(0x0011)
++#define RBBM_GBIF_HALT          GPU_W(0x0016)
++#define RBBM_GBIF_HALT_ACK      GPU_W(0x0017)
++#define RBBM_INTERFACE_HANG_INT_CNTL GPU_W(0x001f)
++#define RBBM_PERFCTR_CNTL       GPU_W(0x0500)
++#define RBBM_PERFCTR_GPU_BUSY_MASKED GPU_W(0x050b)
++#define CP_RB_CNTL              GPU_W(0x0802)
++#define CP_RB_RPTR              GPU_W(0x0806)
++#define CP_RB_WPTR              GPU_W(0x0807)
++#define CP_SQE_CNTL             GPU_W(0x0808)
++#define CP_HW_FAULT             GPU_W(0x0821)
++#define CP_INTERRUPT_STATUS     GPU_W(0x0823)
++#define CP_PROTECT_STATUS       GPU_W(0x0824)
++#define CP_SQE_INSTR_BASE       GPU_W(0x0830)
++#define CP_APRIV_CNTL           GPU_W(0x0844)
++#define CP_ROQ_THRESHOLDS_1     GPU_W(0x08c1)
++#define CP_ROQ_THRESHOLDS_2     GPU_W(0x08c2)
++#define CP_MEM_POOL_SIZE        GPU_W(0x08c3)
++#define CP_AHB_CNTL             GPU_W(0x098d)
++#define UCHE_MODE_CNTL          GPU_W(0x0e01)
++#define UCHE_WRITE_RANGE_MAX    GPU_W(0x0e05)
++#define UCHE_WRITE_THRU_BASE    GPU_W(0x0e07)
++#define UCHE_TRAP_BASE          GPU_W(0x0e09)
++#define UCHE_CACHE_WAYS         GPU_W(0x0e17)
++#define UCHE_FILTER_CNTL        GPU_W(0x0e18)
++#define UCHE_CLIENT_PF          GPU_W(0x0e19)
++#define RB_NC_MODE_CNTL         GPU_W(0x8e08)
++#define PC_DBG_ECO_CNTL         GPU_W(0x9e00)
++#define SP_NC_MODE_CNTL         GPU_W(0xae02)
++#define TPL1_NC_MODE_CNTL       GPU_W(0xb604)
++#define RBBM_SECVID_TRUST_CNTL  GPU_W(0xf400)
++#define RBBM_SECVID_TSB_TRUSTED_BASE GPU_W(0xf800)
++#define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_W(0xf802)
++#define RBBM_SECVID_TSB_CNTL    GPU_W(0xf803)
++#define GBIF_QSB_SIDE0          (4 * 0x03)
++#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 个四字；不回写读指针 */
++#define CP_ME_INIT              0x48
++#define CP_MEM_WRITE            0x3d
++#define CP_SET_SECURE_MODE      0x66
++
++static uint32_t
++odd_parity(uint32_t v)
++{
++	return 0x9669 >> (0xf & (v ^ v >> 4 ^ v >> 8 ^ v >> 12 ^ v >> 16 ^ v >> 20 ^ v >> 24 ^ v >> 28)) & 1;
++}
++
++static void
++ring(uint32_t word)
++{
++	((uint32_t *)core_ring.memory)[ring_at] = word;
++	ring_at = (ring_at + 1) % RING_WORDS;
++}
++
++static void
++ring_command(uint32_t command, uint32_t words)
++{
++	ring(7u << 28 | words | odd_parity(words) << 15 | command << 16 | odd_parity(command) << 23);
++}
++
++static void
++ring_send(void)
++{
++	if (ring_at >= ring_sent) {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (ring_at - ring_sent));
++	} else {
++		to_memory(core_ring.memory + 4 * ring_sent, 4 * (RING_WORDS - ring_sent));
++		to_memory(core_ring.memory, 4 * ring_at);
++	}
++	ring_sent = ring_at;
++	wr(gpu.base + CP_RB_WPTR, ring_at);
++}
++
++static bool
++ring_run(const char *what)
++{
++	uint32_t taken = ~0u, status = ~0u;
++	printf(TAG ": %u: have the 3D core %s: the ring up to word %u\n", step, what, ring_at);
++	snprintf(last_write, sizeof(last_write), "step %u had the 3D core %s", step, what);
++	ring_send();
++	for (int i = 0; i < 20000 && (taken != ring_at || (status & ~1u)); i++) {
++		sleep_us(100);
++		taken = rd(gpu.base + CP_RB_RPTR);
++		status = rd(gpu.base + RBBM_STATUS);
++	}
++	if (taken == ring_at && !(status & ~1u) && rd(gpu.base + CP_HW_FAULT) == 0 && !space_faulted(&core_space)) {
++		printf(TAG ": %u: the 3D core has done it (ring read up to %u, status %#x)\n", step, taken, status);
++		return true;
++	}
++	printf(TAG ": %u: the 3D core does not get through: ring read up to %u of %u, status %#x, interrupts %#x, "
++	    "cp fault %#x, cp interrupts %#x, protection %#x\n", step, taken, ring_at, status,
++	    rd(gpu.base + RBBM_INT_0_STATUS), rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS),
++	    rd(gpu.base + CP_PROTECT_STATUS));
++	space_faulted(&core_space);
++	return false;
++}
++
++static void
++put64(struct block *b, const char *name, uint32_t off, uint64_t v)
++{
++	put(b, name, off, (uint32_t)v);
++	put(b, name, off + 4, (uint32_t)(v >> 32));
++}
++
++static bool
++step_core_space(void)
++{
++	const uint8_t *sqe;
++	unsigned int size = 0;
++	if (!cx_ready() || !core_is_on) {
++		return false;
++	}
++	announce("make the 3D core's memory: its ring, its microcode (a650_sqe.fw), a page to write to");
++	sqe = fw_file("a650_sqe.fw", &size);
++	if (sqe == NULL || size < 8 || size > 0x40000 ||
++	    !block_new_as(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
++	    !block_new_as(&core_space, &core_sqe, CORE_SQE_ADDRESS, size - 4, PTE_CORE | PTE_READ_ONLY) ||
++	    !block_new_as(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE)) {
++		return false;
++	}
++	memcpy((void *)core_sqe.memory, sqe + 4, size - 4);     /* kgsl _load_firmware：第一个字不是微码 */
++	to_memory(core_sqe.memory, core_sqe.size);
++	announce("give SMMU context 0 these tables and send the 3D core's streams 0 and 1 through it "
++	    "(device tree gfx3d_user iommus = <kgsl_smmu 0 0x401>)");
++	core_space_is_on = true;
++	if (!space_on(&core_space, CORE_MATCH, 0)) {
++		return false;
++	}
++	core_stream1_is_on = true;
++	put(&smmu, "s2cr", SMMU_S2CR(CORE_STREAM1_MATCH), core_space.context);
++	put(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH), SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | 1);
++	if (get(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH)) != (SMMU_SMR_VALID | SMMU_STREAM_MASK << 16 | 1)) {
++		printf(TAG ": %u: the SMMU did not take stream 1\n", step);
++		return false;
++	}
++	get(&gpu, "rbbm_status", RBBM_STATUS);
++	return !space_faulted(&core_space);
++}
++
++/* ---------------------------------------------------------------- 16. 3D 核心启动 */
++
++static bool
++step_core_start(void)
++{
++	/* a6xx_init：CP VSC GRAS RB PC HLSQ VFD VPC UCHE SP TPL1 和 RBBM_SECVID_TSB 的地址模式都是 64 位 */
++	static const uint32_t address_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00,
++		                                  0xae01, 0xb601, 0xf810 };
++	if (!cx_ready() || !core_is_on || !core_space_is_on) {
++		return false;
++	}
++	announce("write the 3D core's registers (vendor adreno_a6xx.c a6xx_start for a620): the first writes to the core");
++	put(&gbif, "halt", GBIF_HALT, 0);
++	put(&gpu, "rbbm_gbif_halt", RBBM_GBIF_HALT, 0);
++	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
++	put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
++	put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
++	for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
++		put(&gpu, "address mode 64-bit", GPU_W(address_modes[i]), 1);
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		put(&gbif, "qsb_side", GBIF_QSB_SIDE0 + 4 * i, 0x00071620);    /* a650_gbif_regs */
++	}
++	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 3);
++	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
++	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++	put64(&gpu, "uche_write_thru_base", UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++	put(&gpu, "uche_filter_cntl", UCHE_FILTER_CNTL, 0x804);
++	put(&gpu, "uche_cache_ways", UCHE_CACHE_WAYS, 0x4);
++	put(&gpu, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x02000140);
++	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
++	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
++	put(&gpu, "pc_dbg_eco_cntl (prim fifo 0x10000, tseskip off)", PC_DBG_ECO_CNTL, 0x00010000 | 1u << 9);
++	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
++	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
++	/* UBWC 3.0、highest-bank-bit 14、min-access-length 32（原厂设备树）：mode 0、amsbc 1、lower_bit 1 */
++	put(&gpu, "rb_nc_mode_cntl", RB_NC_MODE_CNTL, 1u << 4 | 1u << 1);
++	put(&gpu, "tpl1_nc_mode_cntl", TPL1_NC_MODE_CNTL, 1u << 1);
++	put(&gpu, "sp_nc_mode_cntl", SP_NC_MODE_CNTL, 2u << 4 | 1u << 1);
++	put(&gpu, "uche_mode_cntl", UCHE_MODE_CNTL, 1u << 21);
++	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x3ffff);
++	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1);
++	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
++	put64(&gpu, "cp_rb_base", CP_RB_BASE, CORE_RING_ADDRESS);
++	put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE, CORE_SQE_ADDRESS);
++	get(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE);
++	get(&gpu, "cp_rb_base", CP_RB_BASE);
++	get(&gpu, "rbbm_status", RBBM_STATUS);
++
++	announce("start the 3D core's command processor (SQE)");
++	core_runs = true;
++	put(&gpu, "cp_sqe_cntl", CP_SQE_CNTL, 1);
++	sleep_ms(20);
++	printf(TAG ": %u: alive after it; status %#x, interrupts %#x, cp fault %#x, cp interrupts %#x, protection %#x, "
++	    "ring read %u\n", step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS), rd(gpu.base + CP_HW_FAULT),
++	    rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS), rd(gpu.base + CP_RB_RPTR));
++	if (space_faulted(&core_space)) {
++		return false;
++	}
++	announce("give the 3D core its first command, ME_INIT");
++	ring_command(CP_ME_INIT, 8);    /* Linux a6xx_cp_init：0x2f 掩码 */
++	ring(0x0000002f);
++	ring(0x00000003);
++	ring(0x20000000);
++	ring(0);
++	ring(0);
++	ring(0);
++	ring(0);
++	ring(0);
++	if (!ring_run("initialize its command processor")) {
++		return false;
++	}
++	printf(TAG ": %u: THE 3D CORE TAKES COMMANDS\n", step);
++	return true;
++}
++
++/* ---------------------------------------------------------------- 17. zap shader（原厂顺序：CP 起来之后、出安全模式之前） */
++
++static bool
++zap_unload(void)
++{
++	uint64_t answer = ~0ull;
++	return scm("to give up the zap shader", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer) == 0 &&
++	       answer == 0;
++}
++
++static bool
++step_zap(void)
++{
++	const uint8_t *mdt, *seg;
++	unsigned int mdt_size = 0, seg_size = 0;
++	uint64_t answer = ~0ull;
++	vm_offset_t page = 0;
++	if (!cx_ready() || !core_runs) {
++		return false;
++	}
++	if (no_zap) {
++		printf(TAG ": %u: picassonozap=1: no zap shader\n", step);
++		return true;
++	}
++	announce("the zap shader: header a620_zap.mdt to TrustZone (signature), its place 0x8bc15400, the image "
++	    "a620_zap.b02 there, then authenticate and run (PAS 13)");
++	mdt = fw_file("a620_zap.mdt", &mdt_size);
++	seg = fw_file("a620_zap.b02", &seg_size);
++	if (mdt == NULL || seg == NULL || seg_size == 0 || seg_size > 0x1000) {
++		return false;
++	}
++	/* 32 位 ELF：段数在 44，程序头表在 52，每个 32 字节；mdt = ELF 头 + 程序头 + 哈希段（a620：148 + 6712） */
++	uint32_t segments = mdt_size >= 52 + 2 * 32 ? (uint32_t)(mdt[44] | mdt[45] << 8) : 0, hashes = 0;
++	if (memcmp(mdt, "\177ELF\1", 5) != 0 || segments < 2 || mdt_size > PAGE_SIZE) {
++		printf(TAG ": %u: a620_zap.mdt is not such a header\n", step);
++		return false;
++	}
++	memcpy(&hashes, mdt + 52 + 32 + 16, sizeof(hashes));
++	if (52 + 32 * segments + (uint64_t)hashes != mdt_size) {
++		printf(TAG ": %u: a620_zap.mdt: %u segments, %u bytes of hashes, %u bytes: not header + hashes\n", step,
++		    segments, hashes, mdt_size);
++		return false;
++	}
++	if (kmem_alloc_contig(kernel_map, &page, PAGE_SIZE, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	memcpy((void *)page, mdt, mdt_size);
++	to_memory(page, PAGE_SIZE);
++	printf(TAG ": %u: TrustZone first gives up any zap shader it has: %s\n", step, zap_unload() ? "yes" : "it says no");
++	if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++		printf(TAG ": %u: TrustZone does not take the signature (%#llx)\n", step, answer);
++		return false;
++	}
++	printf(TAG ": %u: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n", step);
++	if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY, 0x1000,
++	    &answer) != 0 || answer != 0) {
++		printf(TAG ": %u: TrustZone does not take the place (%#llx)\n", step, answer);
++		return false;
++	}
++	/* 0x8bc15400 不在 16K 页边界上：映射整页再加偏移 */
++	vm_offset_t base = ml_io_map_wcomb((vm_offset_t)(ZAP_MEMORY & ~(uint64_t)PAGE_MASK), PAGE_SIZE * 2);
++	if (base == 0) {
++		return false;
++	}
++	volatile uint8_t *memory = (volatile uint8_t *)(base + (ZAP_MEMORY & PAGE_MASK));
++	printf(TAG ": %u: write %u bytes of a620_zap.b02 at %#llx (it begins %02x %02x %02x %02x)\n", step, seg_size,
++	    ZAP_MEMORY, seg[0], seg[1], seg[2], seg[3]);
++	snprintf(last_write, sizeof(last_write), "step %u wrote the zap shader at %#llx", step, ZAP_MEMORY);
++	for (uint32_t i = 0; i < 0x1000; i++) {
++		memory[i] = i < seg_size ? seg[i] : 0;
++	}
++	settle();
++	if (scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_GPU, 0,
++	    0, &answer) != 0 || answer != 0) {
++		printf(TAG ": %u: TrustZone does not authenticate the zap shader (%#llx)\n", step, answer);
++		return false;
++	}
++	zap_is_loaded = true;
++	printf(TAG ": %u: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER\n", step);
++	return true;
++}
++
++/* ---------------------------------------------------------------- 18. 出安全模式，按命令写一个字 */
++
++static bool
++step_core_commands(void)
++{
++	volatile uint32_t *scratch = (volatile uint32_t *)core_scratch.memory;
++	if (!cx_ready() || !core_runs) {
++		return false;
++	}
++	if (zap_is_loaded) {
++		announce("command the 3D core out of secure mode (CP_SET_SECURE_MODE 0, through the zap shader)");
++		ring_command(CP_SET_SECURE_MODE, 1);
++		ring(0);
++		if (!ring_run("leave secure mode")) {
++			return false;
++		}
++	} else {
++		/* adreno.c adreno_set_unsecured_mode：没有 zap shader 时直接写 RBBM_SECVID_TRUST_CNTL（picassonozap=1） */
++		announce("no zap shader: write RBBM_SECVID_TRUST_CNTL 0 directly (vendor's path without one)");
++		put(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL, 0);
++		get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
++	}
++	announce("command the 3D core to write a word into a page of ours (CP_MEM_WRITE)");
++	scratch[0] = 0;
++	to_memory(core_scratch.memory, 64);
++	ring_command(CP_MEM_WRITE, 3);
++	ring(CORE_SCRATCH_ADDRESS);
++	ring(0);
++	ring(0x600dc0de);
++	if (!ring_run("write a word to memory")) {
++		return false;
++	}
++	to_memory(core_scratch.memory, 64);
++	printf(TAG ": %u: the page reads %#x: %s\n", step, scratch[0], scratch[0] == 0x600dc0de ?
++	    "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what it was told to write");
++	return scratch[0] == 0x600dc0de;
++}
++
+ /* ---------------------------------------------------------------- 撤回 */
+ 
+ static void
+@@ -1500,6 +1955,19 @@ gpu_block_stop(void)
+ 	step = 99;
+ 	newest_step = ~0u;
+ 	printf(TAG ": --- giving everything back, in reverse\n");
++	if (core_runs && core_is_on) {
++		/* Linux a6xx_bus_clear_pending_transactions：GBIF 先停住正在进行的请求再放开（GMU 也走这条总线） */
++		printf(TAG ": the 3D core before it stops: status %#x, ring read %u of %u\n", rd(gpu.base + RBBM_STATUS),
++		    rd(gpu.base + CP_RB_RPTR), ring_at);
++		wr(gbif.base + GBIF_HALT, 1);
++		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 1); i++) {
++		}
++		wr(gbif.base + GBIF_HALT, 2);
++		for (int i = 0; i < 100000 && !(rd(gbif.base + GBIF_HALT_ACK) & 2); i++) {
++		}
++		wr(gbif.base + GBIF_HALT, 0);
++		core_runs = false;
++	}
+ 	if (core_is_on) {
+ 		put(&gmu, "host2gmu_intr_set (OOB GPU clear)", GMU_HOST2GMU_INTR_SET, GMU_OOB_GPU_CLEAR);
+ 		core_is_on = false;
+@@ -1529,6 +1997,20 @@ gpu_block_stop(void)
+ 		put(&gmu, "rscc_control_req", GMU_RSCC_CONTROL_REQ, 0);
+ 	}
+ 	rsc_awake = false;
++	if (zap_is_loaded) {
++		printf(TAG ": the zap shader: %s\n", zap_unload() ? "TrustZone has given it up" : "TrustZone does not give it up");
++		zap_is_loaded = false;
++	}
++	if (core_stream1_is_on) {
++		put(&smmu, "smr", SMMU_SMR(CORE_STREAM1_MATCH), 0);
++		put(&smmu, "s2cr", SMMU_S2CR(CORE_STREAM1_MATCH), SMMU_S2CR_FAULT);
++		core_stream1_is_on = false;
++	}
++	if (core_space_is_on) {
++		space_faulted(&core_space);
++		space_off(&core_space, CORE_MATCH);
++		core_space_is_on = false;
++	}
+ 	if (gmu_space_is_on) {
+ 		space_faulted(&gmu_space);
+ 		space_off(&gmu_space, gmu_match);
+@@ -1550,7 +2032,7 @@ gpu_block_stop(void)
+ 
+ static bool(*const steps[])(void) = {
+ 	step_cx, step_words, step_rscc, step_smmu, step_tcm, step_cmd_db, step_space, step_rpmh, step_load,
+-	step_start, step_hfi, step_tables, step_gx,
++	step_start, step_hfi, step_tables, step_gx, step_tz, step_core_space, step_core_start, step_zap, step_core_commands,
+ };
+ #define STEPS ((uint32_t)(sizeof(steps) / sizeof(steps[0])))
+ 
