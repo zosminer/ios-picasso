@@ -39,6 +39,15 @@
 - **新机首次启动慢的根因（已有旁证，待验证）**：设备树 `/chosen` 缺 `mac-address-wifi0`。Poco F1（Bergamota NOTES.md 第 322 行）和 flame 都遇到并修了同样的症状：MobileGestalt 每问一次 Wi-Fi 地址就等一个永远不出现的网络控制器，
   lsd 首次建库要问很多次。我们的 ADT 确实没有这个属性（已核对）。已在 `tools/mkadt.py` 的 `/chosen` 加了 `mac-address-wifi0/bluetooth0/ethernet0`（locally administered，02:50:49:43:41:01..03），
   k31（`shim/out/shim-boot-k31.img`，命令行同 k29，ADT 同 k29 加三个地址）。**验证需要全新的 LaunchServices 库，即重写 userdata**。
+- **MAC 地址修法验证（2026-11-02 10:01 启动 k31，用户报告）**：重写 userdata 后（全新 LaunchServices 库）用 k31 启动，用户一碰屏幕就进了设置界面（前三次 13 分钟以上还在苹果 logo）。
+  设置里多出了“蓝牙”一行（Unavailable），Wi-Fi 一行显示 Off。**准确进桌面的时间用户没记**，所以“快了多少”还没有数字；但结论方向明确：**修法有效**。状态栏时间 4:03（没有 RTC，已知）。
+- **userdata 的写入方式（2026-11-02）**：fastboot 在这台上两次中途 USB 断开（第 2 块、第 13 块 `usb_write failed e00002ed`，另一次整整卡死）。改用 `tools/simg-adb-write.py`
+  （OrangeFox 里 adb 流式写，32 MiB 一段、每段回读 SHA-256、失败重试，`--resume-mib=N` 续写）：16 GiB 用时约 32 分钟，期间 1 次校验重试、1 次连续失败，续写后通过；
+  最后在手机上算 userdata 前 16 GiB 的 SHA-256 == 本地展开稀疏镜像的 SHA-256（6e160283…），端到端一致。没换线。
+- **Wi-Fi 阶段 A（进行中）**：补丁 **0115**（`xnu/patches/0115-picasso-pmem-rpmh-generic.patch`）= ios-flame 的 0094 里的 `sweet_pmem.c`（/dev/pmem）+ 0102 的 `sweet_rpmh_write`（通用 RPMh，
+  ARC/VRM 任意命令）+ `PMEM_RPMH` ioctl + `sweet_ufs.c` 里 `sweet_pmem_init()`（picasso_cpufreq_init 之后）+ `bsd/conf/files`。flame 的 0094 里对 `sweet_files.c`/`sweet_ufs.c` 的其它改动与我们冲突，没取。
+  `tools/check-patch-series.py`：本仓库补丁 115 个全部应用、跳过 0。**还没编译**：CI run **41377109190**（`gh workflow run xnu.yml --ref picasso`，picasso 分支，main 仍在 0114）。
+  注意：本地没有 `~/swift` 的 clang，`xnu-cc.py` 的本地单文件编译检查用不了。
 - **基带固件（已观测）**：Hexagon（ELF machine 164），35 个程序段，物理地址 0x8c000000–0x9b803000（约 248 MiB），入口 0x8c000000。
   设备树 `qcom,mss@4080000`：`qcom,pil-tz-generic`、PAS id 4、memory-region = 0x8c000000+0xf800000（与固件范围吻合）、**不是 MBA 流程**；
   需要 vdd_cx/vdd_mss、XO 时钟、总线投票、AOP 邮箱（`qcom,signal-aop`）、5 个中断（wdog/err-fatal/err-ready/proxy-unvote/stop-ack/shutdown-ack）、smem-id 0x1a5。
